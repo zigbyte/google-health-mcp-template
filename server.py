@@ -2,8 +2,8 @@
 Google Health MCP Bridge for Gemini (hosted on Google Cloud Run).
 
 Exposes read-only tools backed by the Google Health API v4
-(https://health.googleapis.com/v4) over Streamable HTTP using FastMCP,
-Google OAuth 2.0, and optional Firestore persistence.
+(https://health.googleapis.com/v4) over Streamable HTTP using FastMCP
+and Google OAuth 2.0.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ HEALTH_SCOPES = [
     "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
     "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+    "https://www.googleapis.com/auth/googlehealth.nutrition.readonly",
+    "https://www.googleapis.com/auth/googlehealth.nutrition.writeonly",
 ]
 
 
@@ -69,8 +71,9 @@ def _build_auth_provider() -> GoogleProvider:
 mcp = FastMCP(
     name="Google Health Bridge",
     instructions=(
-        "Read-only bridge to the user's Google Health API v4 data (steps, sleep, "
-        "heart rate, daily HRV, and exercises). Dates use YYYY-MM-DD format."
+        "Bridge to the user's Google Health API v4 data: read steps, sleep, "
+        "heart rate, daily HRV, exercises, and meals; log meals and water intake. "
+        "Dates use YYYY-MM-DD format."
     ),
     auth=_build_auth_provider(),
 )
@@ -334,6 +337,181 @@ async def get_exercises(
         "end_date": end,
         "workout_count": len(points),
         "workouts": points,
+    }
+
+
+async def _create_data_point(
+    data_type: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Create a dataPoint in Google Health API v4."""
+    token = _get_verified_token()
+    url = f"{HEALTH_API_BASE}/users/me/dataTypes/{data_type}/dataPoints"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, headers=headers, json=body)
+        if resp.status_code == 401:
+            raise PermissionError(
+                "Google Health API rejected the token (401). Please re-authenticate."
+            )
+        if resp.status_code == 403:
+            raise PermissionError(
+                f"Google Health API returned 403 Forbidden writing to '{data_type}'. "
+                "Verify the nutrition write scope was granted (disconnect & reconnect in Gemini)."
+            )
+        if resp.status_code >= 400:
+            raise ValueError(
+                f"Google Health API returned {resp.status_code} for '{data_type}': {resp.text}"
+            )
+        return resp.json()
+
+
+@mcp.tool
+async def get_meals(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """
+    Get logged meals / nutrition entries from Google Health for a date range (YYYY-MM-DD).
+    Defaults to today and yesterday (last 2 days) if dates are omitted.
+    """
+    start, end = _default_date_range(start_date, end_date, default_days=2)
+    end_exclusive = _next_day_iso(end)
+    filter_expr = (
+        f'nutrition_log.interval.start_time >= "{start}T00:00:00Z" '
+        f'AND nutrition_log.interval.start_time < "{end_exclusive}T00:00:00Z"'
+    )
+
+    points = await _fetch_data_points(
+        "nutrition-log", filter_expr=filter_expr, page_size=200
+    )
+    return {
+        "start_date": start,
+        "end_date": end,
+        "meal_count": len(points),
+        "meals": points,
+    }
+
+
+@mcp.tool
+async def log_meal(
+    food_name: str,
+    calories_kcal: float,
+    meal_type: str = "ANY_TIME",
+    protein_grams: float | None = None,
+    carbs_grams: float | None = None,
+    fat_grams: float | None = None,
+    fiber_grams: float | None = None,
+    sugar_grams: float | None = None,
+    eaten_at: str | None = None,
+) -> dict[str, Any]:
+    """
+    Log a meal or food item into Google Health (nutrition-log).
+
+    Args:
+        food_name: Name/description of the meal (e.g., "Grilled Chicken Salad").
+        calories_kcal: Total calories in kcal.
+        meal_type: One of BREAKFAST, LUNCH, DINNER, SNACK, or ANY_TIME.
+        protein_grams: Optional protein in grams.
+        carbs_grams: Optional total carbohydrates in grams.
+        fat_grams: Optional total fat in grams.
+        fiber_grams: Optional dietary fiber in grams.
+        sugar_grams: Optional total sugar in grams.
+        eaten_at: Optional ISO-8601 UTC timestamp (e.g., "2026-11-19T12:30:00Z"). Defaults to now.
+    """
+    valid_meal_types = {"BREAKFAST", "LUNCH", "DINNER", "SNACK", "ANY_TIME"}
+    normalized_meal_type = meal_type.strip().upper()
+    if normalized_meal_type not in valid_meal_types:
+        normalized_meal_type = "ANY_TIME"
+
+    if eaten_at:
+        start_dt = datetime.fromisoformat(eaten_at.replace("Z", "+00:00"))
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        start_dt = start_dt.astimezone(timezone.utc)
+    else:
+        start_dt = datetime.now(timezone.utc)
+
+    end_dt = start_dt + timedelta(minutes=15)
+
+    nutrition_log: dict[str, Any] = {
+        "interval": {
+            "startTime": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "endTime": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        "foodDisplayName": food_name.strip(),
+        "mealType": normalized_meal_type,
+        "energy": {"kcal": round(float(calories_kcal), 1)},
+    }
+
+    if carbs_grams is not None:
+        nutrition_log["totalCarbohydrate"] = {"grams": round(float(carbs_grams), 1)}
+    if fat_grams is not None:
+        nutrition_log["totalFat"] = {"grams": round(float(fat_grams), 1)}
+
+    nutrients: list[dict[str, Any]] = []
+    if protein_grams is not None:
+        nutrients.append(
+            {"nutrient": "PROTEIN", "quantity": {"grams": round(float(protein_grams), 1)}}
+        )
+    if fiber_grams is not None:
+        nutrients.append(
+            {"nutrient": "DIETARY_FIBER", "quantity": {"grams": round(float(fiber_grams), 1)}}
+        )
+    if sugar_grams is not None:
+        nutrients.append(
+            {"nutrient": "TOTAL_SUGARS", "quantity": {"grams": round(float(sugar_grams), 1)}}
+        )
+    if nutrients:
+        nutrition_log["nutrients"] = nutrients
+
+    created = await _create_data_point("nutrition-log", {"nutritionLog": nutrition_log})
+    return {
+        "status": "logged",
+        "meal": created,
+    }
+
+
+@mcp.tool
+async def log_water(
+    milliliters: float,
+    logged_at: str | None = None,
+) -> dict[str, Any]:
+    """
+    Log water / hydration intake into Google Health (hydration-log).
+
+    Args:
+        milliliters: Volume of water consumed in milliliters (e.g., 500 for 500ml, ~250 for 1 cup).
+        logged_at: Optional ISO-8601 UTC timestamp. Defaults to now.
+    """
+    if logged_at:
+        start_dt = datetime.fromisoformat(logged_at.replace("Z", "+00:00"))
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        start_dt = start_dt.astimezone(timezone.utc)
+    else:
+        start_dt = datetime.now(timezone.utc)
+
+    end_dt = start_dt + timedelta(seconds=1)
+    body = {
+        "hydrationLog": {
+            "interval": {
+                "startTime": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endTime": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            "amountConsumed": {
+                "milliliters": round(float(milliliters), 1),
+            },
+        }
+    }
+    created = await _create_data_point("hydration-log", body)
+    return {
+        "status": "logged",
+        "hydration": created,
     }
 
 

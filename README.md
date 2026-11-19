@@ -18,14 +18,17 @@ Google Cloud Run (your-service.run.app)
 ```
 
 ### Exposed MCP Tools
-| Tool | Google Health v4 Data Type | Default Window |
+| Tool | Google Health v4 Data Type | Access / Default Window |
 | :--- | :--- | :--- |
-| `get_steps` | `steps` | Last 7 days (daily totals) |
-| `get_sleep` | `sleep` | Last 7 days (sessions) |
-| `get_heart_rate` | `heart-rate` | Last 3 days (daily min/max/avg BPM) |
-| `get_daily_hrv` | `daily-heart-rate-variability` | Last 14 days |
-| `get_exercises` | `exercise` | Last 14 days |
-| `query_health_data_type` | Any v4 `dataType` | Custom filter |
+| `get_steps` | `steps` | Read · Last 7 days (daily totals) |
+| `get_sleep` | `sleep` | Read · Last 7 days (sessions) |
+| `get_heart_rate` | `heart-rate` | Read · Last 3 days (daily min/max/avg BPM) |
+| `get_daily_hrv` | `daily-heart-rate-variability` | Read · Last 14 days |
+| `get_exercises` | `exercise` | Read · Last 14 days |
+| `get_meals` | `nutrition-log` | Read · Last 2 days |
+| `log_meal` | `nutrition-log` | Write · Log food, calories, macros, meal type |
+| `log_water` | `hydration-log` | Write · Log water intake (mL) |
+| `query_health_data_type` | Any v4 `dataType` | Read · Custom filter |
 
 ---
 
@@ -72,6 +75,8 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
    * `https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly`
    * `https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly`
    * `https://www.googleapis.com/auth/googlehealth.sleep.readonly`
+   * `https://www.googleapis.com/auth/googlehealth.nutrition.readonly`
+   * `https://www.googleapis.com/auth/googlehealth.nutrition.writeonly`
 3. Under **Audience**, switch **Publishing status** from *Testing* to **In production** (personal apps under 100 users do not need public verification, and *In production* prevents Google's 7-day refresh token expiration).
 4. Under **Clients → Create Client → Web application**, create an OAuth 2.0 Web Client and save your **Client ID** and **Client Secret** in a password manager.
 
