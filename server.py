@@ -382,8 +382,8 @@ async def get_meals(
     start, end = _default_date_range(start_date, end_date, default_days=2)
     end_exclusive = _next_day_iso(end)
     filter_expr = (
-        f'nutrition_log.interval.start_time >= "{start}T00:00:00Z" '
-        f'AND nutrition_log.interval.start_time < "{end_exclusive}T00:00:00Z"'
+        f'nutrition_log.interval.civil_start_time >= "{start}T00:00:00" '
+        f'AND nutrition_log.interval.civil_start_time < "{end_exclusive}T00:00:00"'
     )
 
     points = await _fetch_data_points(
