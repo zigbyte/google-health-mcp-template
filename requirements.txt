@@ -1,0 +1,3 @@
+fastmcp>=2.12.0
+httpx>=0.28.0
+py-key-value-aio[firestore]>=0.2.0
