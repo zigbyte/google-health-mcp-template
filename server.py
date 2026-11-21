@@ -8,7 +8,12 @@ and Google OAuth 2.0.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import logging
 import os
+import time
+import weakref
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -16,13 +21,26 @@ from urllib.parse import parse_qsl, urlencode
 
 import httpx
 import uvicorn
+from cryptography.fernet import Fernet
 from fastmcp import FastMCP
+from fastmcp.server.auth.jwt_issuer import derive_jwt_key
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.dependencies import get_access_token
+from key_value.aio.adapters.pydantic import PydanticAdapter
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from mcp.server.auth.provider import AccessToken, RefreshToken, TokenError
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import BaseModel
 from starlette.middleware import Middleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+logger = logging.getLogger(__name__)
+
 HEALTH_API_BASE = "https://health.googleapis.com/v4"
+FASTMCP_ACCESS_TOKEN_EXPIRY_SECONDS = 2_592_000  # 30 days
+TOKEN_EXPIRY_THRESHOLD_SECONDS = 300  # Proactively refresh upstream 5m before expiry
+TOKEN_CACHE_TTL_SECONDS = 300  # Cache Google tokeninfo checks for 5m
+REFRESH_GRACE_PERIOD_SECONDS = 300  # 5-minute idempotent refresh rotation grace window
 
 HEALTH_SCOPES = [
     "openid",
@@ -35,9 +53,196 @@ HEALTH_SCOPES = [
 ]
 
 
+def _hash_refresh_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class _RefreshGraceEntry(BaseModel):
+    client_id: str
+    scopes: list[str]
+    expires_at: int
+    access_token: str
+    token_type: str = "Bearer"
+    expires_in: int | None = None
+    refresh_token: str | None = None
+    scope: str | None = None
+
+
+class _RefreshGracePointer(BaseModel):
+    old_token_hash: str
+
+
+class GracefulGoogleProvider(GoogleProvider):
+    """GoogleProvider with an idempotent refresh-token rotation grace window.
+
+    When a client retries POST /token with an already-rotated refresh token
+    (for example after a cold-start timeout), this provider serves the exact
+    same OAuthToken response for ``refresh_grace_period_seconds`` without
+    re-calling Google or rotating a second time.
+    """
+
+    def __init__(
+        self,
+        *,
+        refresh_grace_period_seconds: int = REFRESH_GRACE_PERIOD_SECONDS,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._refresh_grace_seconds = max(0, int(refresh_grace_period_seconds))
+        self._grace_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+        grace_encryption_key = derive_jwt_key(
+            high_entropy_material=self._jwt_signing_key.decode("utf-8"),
+            salt="fastmcp-refresh-grace-encryption-key",
+        )
+        encrypted_grace_kv = FernetEncryptionWrapper(
+            key_value=self._client_storage,
+            fernet=Fernet(key=grace_encryption_key),
+            raise_on_decryption_error=False,
+        )
+        self._refresh_grace_store: PydanticAdapter[_RefreshGraceEntry] = (
+            PydanticAdapter[_RefreshGraceEntry](
+                key_value=encrypted_grace_kv,
+                pydantic_model=_RefreshGraceEntry,
+                default_collection="mcp-refresh-token-grace",
+                raise_on_validation_error=False,
+            )
+        )
+        self._refresh_grace_reverse_store: PydanticAdapter[_RefreshGracePointer] = (
+            PydanticAdapter[_RefreshGracePointer](
+                key_value=encrypted_grace_kv,
+                pydantic_model=_RefreshGracePointer,
+                default_collection="mcp-refresh-token-grace-rev",
+                raise_on_validation_error=False,
+            )
+        )
+
+    def _get_grace_lock(self, token_hash: str) -> asyncio.Lock:
+        lock = self._grace_locks.get(token_hash)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._grace_locks[token_hash] = lock
+        return lock
+
+    async def load_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: str,
+    ) -> RefreshToken | None:
+        token_hash = _hash_refresh_token(refresh_token)
+        lock = self._get_grace_lock(token_hash)
+        async with lock:
+            token = await super().load_refresh_token(client, refresh_token)
+            if token is not None or self._refresh_grace_seconds <= 0:
+                return token
+
+            grace = await self._refresh_grace_store.get(key=token_hash)
+            if grace is None:
+                return None
+            if time.time() > grace.expires_at:
+                await self._refresh_grace_store.delete(key=token_hash)
+                return None
+            if grace.client_id != client.client_id:
+                logger.warning(
+                    "Grace refresh token client_id mismatch: expected %s, got %s",
+                    client.client_id,
+                    grace.client_id,
+                )
+                return None
+
+            return RefreshToken(
+                token=refresh_token,
+                client_id=grace.client_id,
+                scopes=grace.scopes,
+                expires_at=grace.expires_at,
+            )
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        if self._refresh_grace_seconds <= 0:
+            return await super().exchange_refresh_token(client, refresh_token, scopes)
+
+        token_hash = _hash_refresh_token(refresh_token.token)
+        lock = self._get_grace_lock(token_hash)
+        async with lock:
+            grace = await self._refresh_grace_store.get(key=token_hash)
+            if grace is not None:
+                if time.time() > grace.expires_at:
+                    await self._refresh_grace_store.delete(key=token_hash)
+                    raise TokenError("invalid_grant", "Refresh token grace window expired")
+                if grace.client_id != client.client_id:
+                    raise TokenError("invalid_grant", "Refresh token client mismatch")
+                if scopes and not set(scopes).issubset(set(grace.scopes)):
+                    raise TokenError(
+                        "invalid_scope",
+                        "Requested scopes exceed original refresh grant",
+                    )
+
+                logger.info(
+                    "Serving idempotent grace-window refresh response for client=%s (token_hash=%s)",
+                    client.client_id,
+                    token_hash[:8],
+                )
+                return OAuthToken(
+                    access_token=grace.access_token,
+                    token_type=grace.token_type,
+                    expires_in=grace.expires_in,
+                    refresh_token=grace.refresh_token,
+                    scope=grace.scope,
+                )
+
+            new_token = await super().exchange_refresh_token(
+                client, refresh_token, scopes
+            )
+
+            grace_expires_at = int(time.time()) + self._refresh_grace_seconds
+            entry = _RefreshGraceEntry(
+                client_id=client.client_id or "",
+                scopes=list(refresh_token.scopes),
+                expires_at=grace_expires_at,
+                access_token=new_token.access_token,
+                token_type=new_token.token_type,
+                expires_in=new_token.expires_in,
+                refresh_token=new_token.refresh_token,
+                scope=new_token.scope,
+            )
+            await self._refresh_grace_store.put(
+                key=token_hash,
+                value=entry,
+                ttl=self._refresh_grace_seconds,
+            )
+            if new_token.refresh_token:
+                await self._refresh_grace_reverse_store.put(
+                    key=_hash_refresh_token(new_token.refresh_token),
+                    value=_RefreshGracePointer(old_token_hash=token_hash),
+                    ttl=self._refresh_grace_seconds,
+                )
+            return new_token
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        if isinstance(token, RefreshToken):
+            token_hash = _hash_refresh_token(token.token)
+            await self._refresh_grace_store.delete(key=token_hash)
+            pointer = await self._refresh_grace_reverse_store.get(key=token_hash)
+            if pointer is not None:
+                await self._refresh_grace_store.delete(key=pointer.old_token_hash)
+                await self._refresh_grace_reverse_store.delete(key=token_hash)
+        await super().revoke_token(token)
+
+
+def _use_firestore_enabled() -> bool:
+    return os.environ.get("USE_FIRESTORE", "").strip().lower() in ("1", "true", "yes")
+
+
 def _build_client_storage():
     """Return a Firestore-backed AsyncKeyValue store when USE_FIRESTORE=true."""
-    if os.environ.get("USE_FIRESTORE", "").strip().lower() not in ("1", "true", "yes"):
+    if not _use_firestore_enabled():
         return None
 
     from key_value.aio.stores.firestore import FirestoreStore
@@ -56,8 +261,13 @@ def _build_auth_provider() -> GoogleProvider:
         raise RuntimeError(
             "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables must be set."
         )
+    if _use_firestore_enabled() and not jwt_signing_key:
+        raise RuntimeError(
+            "JWT_SIGNING_KEY must be set when USE_FIRESTORE=true so tokens "
+            "and encrypted refresh grace records remain valid across restarts."
+        )
 
-    return GoogleProvider(
+    return GracefulGoogleProvider(
         client_id=client_id,
         client_secret=client_secret,
         base_url=base_url,
@@ -65,6 +275,10 @@ def _build_auth_provider() -> GoogleProvider:
         required_scopes=HEALTH_SCOPES,
         jwt_signing_key=jwt_signing_key,
         client_storage=_build_client_storage(),
+        fastmcp_access_token_expiry_seconds=FASTMCP_ACCESS_TOKEN_EXPIRY_SECONDS,
+        token_expiry_threshold_seconds=TOKEN_EXPIRY_THRESHOLD_SECONDS,
+        cache_ttl_seconds=TOKEN_CACHE_TTL_SECONDS,
+        refresh_grace_period_seconds=REFRESH_GRACE_PERIOD_SECONDS,
     )
 
 

@@ -12,10 +12,15 @@ Gemini (Web & Mobile)
    ▼
 Google Cloud Run (your-service.run.app)
    ├── FilterOAuthScopesMiddleware  → strips client-internal scopes on /authorize
-   ├── FastMCP GoogleProvider       → handles MCP OAuth 2.0 proxy + Google sign-in
-   ├── FirestoreStore (default)     → persists OAuth client registrations & tokens across cold starts
-   └── Read-Only Health Tools       → queries https://health.googleapis.com/v4/users/me/dataTypes/*
+   ├── GracefulGoogleProvider       → FastMCP OAuth 2.0 proxy + 30d access token, 5m proactive upstream refresh, & 5m idempotent refresh grace window
+   ├── FirestoreStore (default)     → persists OAuth client registrations, tokens, & encrypted grace records across cold starts
+   └── Health Tools                 → queries/logs https://health.googleapis.com/v4/users/me/dataTypes/*
 ```
+
+### Cold-Start & OAuth Resilience (Always Free Tier)
+* **30-day FastMCP access tokens + proactive upstream refresh:** `GracefulGoogleProvider` issues 30-day FastMCP access tokens (`fastmcp_access_token_expiry_seconds=2592000`) and transparently refreshes Google's 1-hour upstream token 5 minutes before expiry (`token_expiry_threshold_seconds=300`, `cache_ttl_seconds=300`), eliminating routine `/token` calls during cold starts.
+* **5-minute idempotent refresh grace window:** Rotated refresh tokens remain valid for 5 minutes (stored Fernet-encrypted in Firestore) so if a client times out during a cold start and retries `/token` with the previous refresh token, it receives the already-minted token set instead of `401 invalid_grant`.
+* **Faster cold starts:** `Dockerfile` pre-compiles `.pyc` bytecode during build and `requirements.txt` pins `fastmcp-slim[server]==4.2.2` and `py-key-value-aio[firestore,wrappers-encryption]==0.5.0`.
 
 ### Exposed MCP Tools
 | Tool | Google Health v4 Data Type | Access / Default Window |
@@ -122,7 +127,20 @@ Click **Save**.
 3. Complete the Google sign-in prompt (click **Advanced → Go to …** once if your app is unverified).
 4. *(Optional)* In Gemini **Settings → Saved info**, add a rule telling Gemini to always use your `Google Health` connected app whenever you ask about steps, sleep, heart rate, HRV, or workouts.
 
-### 7. Recommended: Set a Monthly Budget Alert
+### 7. Optional ($0/month): Cloud Scheduler Keep-Warm Ping
+Cloud Run scales to zero after ~15 minutes of inactivity. You can optionally create 1 free Cloud Scheduler job (3 jobs/month Always Free per billing account; under request-based billing, idle time between pings is not billed) to keep the container warm most of the time:
+```bash
+gcloud services enable cloudscheduler.googleapis.com
+
+gcloud scheduler jobs create http google-health-mcp-keepwarm \
+  --location=us-central1 \
+  --schedule="*/10 * * * *" \
+  --uri="${SERVICE_URL}/.well-known/oauth-authorization-server" \
+  --http-method=GET \
+  --attempt-deadline=30s
+```
+
+### 8. Recommended: Set a Monthly Budget Alert
 ```bash
 BILLING_ACCOUNT=$(gcloud billing projects describe "$PROJECT_ID" --format="value(billingAccountName)" | cut -d/ -f2)
 gcloud services enable billingbudgets.googleapis.com
