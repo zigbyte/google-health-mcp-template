@@ -601,25 +601,19 @@ async def get_steps(
     end_date: str | None = None,
 ) -> dict[str, Any]:
     """
-    Get daily step totals from Google Health for a date range (YYYY-MM-DD).
+    Get reconciled daily step totals from Google Health for a date range (YYYY-MM-DD),
+    bucketed in the user's local timezone using dataPoints:rollUp to avoid multi-source double-counting.
     Defaults to the last 7 days if dates are omitted.
     """
     start, end = _default_date_range(start_date, end_date, default_days=7)
-    start_utc, end_utc = _utc_bounds_for_local_dates(start, end)
-    filter_expr = (
-        f'steps.interval.start_time >= "{start_utc}" '
-        f'AND steps.interval.start_time < "{end_utc}"'
-    )
-
-    points = await _fetch_data_points("steps", filter_expr=filter_expr, page_size=5000)
+    rollups = await _rollup_data_points("steps", start, end, window_size="86400s")
 
     daily_totals: dict[str, int] = defaultdict(int)
-    for pt in points:
-        steps_obj = pt.get("steps", {})
-        interval = steps_obj.get("interval", {})
-        ts = interval.get("startTime") or ""
-        day = _iso_to_local_date(ts) if ts else _format_proto_date(interval.get("civilStartTime", {}).get("date"))
-        count = steps_obj.get("count") or steps_obj.get("countSum") or 0
+    for rp in rollups:
+        ts = rp.get("startTime") or rp.get("range", {}).get("startTime") or ""
+        day = _iso_to_local_date(ts) if ts else "unknown"
+        steps_obj = rp.get("steps") or {}
+        count = steps_obj.get("countSum") or steps_obj.get("count") or 0
         daily_totals[day] += int(count)
 
     ordered = dict(sorted(daily_totals.items()))
@@ -629,7 +623,8 @@ async def get_steps(
         "end_date": end,
         "total_steps": sum(ordered.values()),
         "daily_steps": ordered,
-        "raw_intervals_fetched": len(points),
+        "rollup_buckets_fetched": len(rollups),
+        "reconciled": True,
     }
 
 
