@@ -307,7 +307,76 @@ MINDFULNESS_COLLECTION = os.environ.get("MINDFULNESS_COLLECTION", "mindfulness_l
 CHECKIN_COLLECTION = os.environ.get("CHECKIN_COLLECTION", "daily_checkins")
 USER_TIMEZONE_NAME = os.environ.get("USER_TIMEZONE", "UTC").strip() or "UTC"
 USER_TZ = ZoneInfo(USER_TIMEZONE_NAME)
+USER_SEX = os.environ.get("USER_SEX", "").strip().lower()
+USER_HEIGHT_CM_RAW = os.environ.get("USER_HEIGHT_CM", "").strip()
+USER_BIRTH_YEAR_RAW = os.environ.get("USER_BIRTH_YEAR", "").strip()
+USER_GOAL_WEIGHT_LBS_RAW = os.environ.get("USER_GOAL_WEIGHT_LBS", "").strip()
 _firestore_client: Any = None
+
+
+def _parse_optional_float(raw: str) -> float | None:
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _parse_optional_int(raw: str) -> int | None:
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _build_user_profile(
+    latest_weight_kg: float | None = None,
+    latest_waist_in: float | None = None,
+) -> dict[str, Any]:
+    """Build the user's static demographic/anthropometric profile from env vars."""
+    profile: dict[str, Any] = {"timezone": USER_TIMEZONE_NAME}
+
+    if USER_SEX:
+        profile["sex"] = USER_SEX
+
+    height_cm = _parse_optional_float(USER_HEIGHT_CM_RAW)
+    if height_cm and height_cm > 0:
+        total_inches = height_cm / 2.54
+        feet = int(total_inches // 12)
+        inches = round(total_inches - feet * 12, 1)
+        profile["height_cm"] = round(height_cm, 1)
+        profile["height_in"] = round(total_inches, 1)
+        profile["height_ft_in"] = f"{feet}'{inches}\""
+
+    birth_year = _parse_optional_int(USER_BIRTH_YEAR_RAW)
+    age: int | None = None
+    if birth_year and 1900 <= birth_year <= datetime.now(USER_TZ).year:
+        age = datetime.now(USER_TZ).year - birth_year
+        profile["birth_year"] = birth_year
+        profile["age"] = age
+        profile["estimated_max_hr_bpm"] = round(208 - 0.7 * age)
+
+    goal_weight_lbs = _parse_optional_float(USER_GOAL_WEIGHT_LBS_RAW)
+    if goal_weight_lbs and goal_weight_lbs > 0:
+        profile["goal_weight_lbs"] = round(goal_weight_lbs, 1)
+        profile["goal_weight_kg"] = round(goal_weight_lbs / 2.20462, 2)
+
+    if latest_weight_kg and height_cm and height_cm > 0:
+        height_m = height_cm / 100.0
+        profile["bmi"] = round(latest_weight_kg / (height_m * height_m), 1)
+        if age is not None and USER_SEX in ("female", "male"):
+            bmr_offset = -161 if USER_SEX == "female" else 5
+            profile["mifflin_st_jeor_bmr_kcal"] = round(
+                10 * latest_weight_kg + 6.25 * height_cm - 5 * age + bmr_offset
+            )
+
+    if latest_waist_in and height_cm and height_cm > 0:
+        profile["waist_to_height_ratio"] = round((latest_waist_in * 2.54) / height_cm, 3)
+
+    return profile
 
 
 def _get_firestore_client() -> Any:
@@ -324,11 +393,12 @@ def _get_firestore_client() -> Any:
 mcp = FastMCP(
     name="Google Health Bridge",
     instructions=(
-        "Bridge to the user's Google Health API v4 data and personal Firestore strength logs: "
-        "read steps, sleep, heart rate, recovery vitals (RHR, respiratory rate, SpO2, HRV), "
-        "daily energy/TDEE & active zone minutes, body composition, hydration, meals, exercises, "
-        "and combined daily cut summaries; log meals, water intake, and strength training sets. "
-        "Dates use YYYY-MM-DD format."
+        "Bridge to the user's Google Health API v4 data and personal Firestore logs: "
+        "read user profile (sex, height, birth year, age, timezone), steps, sleep, heart rate, "
+        "recovery vitals (RHR, respiratory rate, SpO2, HRV), daily energy/TDEE & active zone minutes, "
+        "body composition, hydration, meals, exercises, daily check-ins, mindfulness, strength logs, "
+        "and combined daily cut summaries; log meals, water intake, daily check-ins, mindfulness, "
+        "and strength training sets. Dates use YYYY-MM-DD format."
     ),
     auth=_build_auth_provider(),
 )
@@ -1151,17 +1221,29 @@ async def get_body_composition(
         if len(weights) >= 2
         else None
     )
+    latest_weight_kg = weights[-1]["weight_kg"] if weights else None
     return {
+        "user_profile": _build_user_profile(latest_weight_kg=latest_weight_kg),
         "start_date": start,
         "end_date": end,
         "latest_weight_lbs": weights[-1]["weight_lbs"] if weights else None,
-        "latest_weight_kg": weights[-1]["weight_kg"] if weights else None,
+        "latest_weight_kg": latest_weight_kg,
         "weight_change_lbs": change_lbs,
         "weight_count": len(weights),
         "weights": weights,
         "body_fat_count": len(body_fat),
         "body_fat": body_fat,
     }
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_user_profile() -> dict[str, Any]:
+    """
+    Get the user's base physiological profile (sex, height, birth year, age,
+    estimated max HR, goal weight, and timezone) configured on the bridge.
+    """
+    _get_verified_token()
+    return _build_user_profile()
 
 
 @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
@@ -1272,6 +1354,10 @@ async def get_daily_cut_summary(
 
     return {
         "timezone": USER_TIMEZONE_NAME,
+        "user_profile": _build_user_profile(
+            latest_weight_kg=body_res.get("latest_weight_kg"),
+            latest_waist_in=latest_waist_in,
+        ),
         "start_date": start,
         "end_date": end,
         "latest_weight_lbs": body_res.get("latest_weight_lbs"),
