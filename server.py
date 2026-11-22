@@ -302,6 +302,7 @@ DELETE_ANNOTATIONS = {
 }
 
 STRENGTH_COLLECTION = os.environ.get("STRENGTH_COLLECTION", "strength_logs")
+MINDFULNESS_COLLECTION = os.environ.get("MINDFULNESS_COLLECTION", "mindfulness_logs")
 _firestore_client: Any = None
 
 
@@ -1367,6 +1368,139 @@ async def delete_strength_log(log_id: str) -> dict[str, Any]:
 
     db = _get_firestore_client()
     doc_ref = db.collection(STRENGTH_COLLECTION).document(cleaned_id)
+    snap = await doc_ref.get()
+    if not snap.exists:
+        return {"status": "not_found", "log_id": cleaned_id}
+    await doc_ref.delete()
+    return {"status": "deleted", "log_id": cleaned_id}
+
+
+@mcp.tool(annotations=WRITE_ANNOTATIONS)
+async def log_mindfulness_session(
+    duration_minutes: float,
+    session_type: str = "MEDITATION",
+    calm_pct: float | None = None,
+    stillness_pct: float | None = None,
+    avg_hr_bpm: float | None = None,
+    recoveries: int | None = None,
+    source: str = "Muse",
+    notes: str | None = None,
+    logged_at: str | None = None,
+) -> dict[str, Any]:
+    """
+    Log a mindfulness or meditation session (e.g., Muse S Athena, breathing, guided)
+    into Firestore (`mindfulness_logs`).
+
+    Args:
+        duration_minutes: Session length in minutes (e.g., 15).
+        session_type: MEDITATION, BREATHING, GUIDED, UNGUIDED, FOCUS, SLEEP_PREP, or OTHER.
+        calm_pct: Optional Calm percentage (0-100).
+        stillness_pct: Optional Stillness / body-stillness percentage (0-100).
+        avg_hr_bpm: Optional average heart rate during the session (bpm).
+        recoveries: Optional count of focus/calm recoveries.
+        source: Device or app name (e.g., "Muse S Athena", "Health Coach").
+        notes: Optional session notes.
+        logged_at: Optional ISO-8601 UTC timestamp. Defaults to now.
+    """
+    _get_verified_token()
+    if duration_minutes <= 0 or duration_minutes > 480:
+        raise ValueError("duration_minutes must be between 0 and 480.")
+
+    if logged_at:
+        dt = datetime.fromisoformat(logged_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+
+    doc: dict[str, Any] = {
+        "date": dt.date().isoformat(),
+        "logged_at": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_minutes": round(float(duration_minutes), 1),
+        "session_type": session_type.strip().upper() or "MEDITATION",
+        "source": source.strip() or "Mindfulness",
+    }
+    if calm_pct is not None:
+        doc["calm_pct"] = round(float(calm_pct), 1)
+    if stillness_pct is not None:
+        doc["stillness_pct"] = round(float(stillness_pct), 1)
+    if avg_hr_bpm is not None:
+        doc["avg_hr_bpm"] = round(float(avg_hr_bpm), 1)
+    if recoveries is not None:
+        doc["recoveries"] = int(recoveries)
+    if notes:
+        doc["notes"] = notes.strip()
+
+    db = _get_firestore_client()
+    _, doc_ref = await db.collection(MINDFULNESS_COLLECTION).add(doc)
+    return {
+        "status": "logged",
+        "log_id": doc_ref.id,
+        "session": doc,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_mindfulness_logs(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """
+    Read logged mindfulness / meditation sessions from Firestore (`mindfulness_logs`).
+    Defaults to the last 14 days.
+    """
+    _get_verified_token()
+    start, end = _default_date_range(start_date, end_date, default_days=14)
+    clamped_limit = max(1, min(int(limit), 200))
+
+    db = _get_firestore_client()
+    query = (
+        db.collection(MINDFULNESS_COLLECTION)
+        .where("date", ">=", start)
+        .where("date", "<=", end)
+    )
+
+    sessions: list[dict[str, Any]] = []
+    async for snap in query.stream():
+        data = snap.to_dict() or {}
+        sessions.append({"log_id": snap.id, **data})
+
+    sessions.sort(key=lambda x: str(x.get("logged_at", "")), reverse=True)
+    sessions = sessions[:clamped_limit]
+
+    total_mins = round(sum(float(s.get("duration_minutes") or 0) for s in sessions), 1)
+    calm_vals = [float(s["calm_pct"]) for s in sessions if s.get("calm_pct") is not None]
+    still_vals = [
+        float(s["stillness_pct"]) for s in sessions if s.get("stillness_pct") is not None
+    ]
+
+    return {
+        "start_date": start,
+        "end_date": end,
+        "session_count": len(sessions),
+        "total_minutes": total_mins,
+        "avg_calm_pct": round(sum(calm_vals) / len(calm_vals), 1) if calm_vals else None,
+        "avg_stillness_pct": (
+            round(sum(still_vals) / len(still_vals), 1) if still_vals else None
+        ),
+        "sessions": sessions,
+    }
+
+
+@mcp.tool(annotations=DELETE_ANNOTATIONS)
+async def delete_mindfulness_log(log_id: str) -> dict[str, Any]:
+    """
+    Delete a logged mindfulness session from Firestore by its `log_id`.
+    """
+    _get_verified_token()
+    cleaned_id = log_id.strip()
+    if not cleaned_id:
+        raise ValueError("log_id is required.")
+
+    db = _get_firestore_client()
+    doc_ref = db.collection(MINDFULNESS_COLLECTION).document(cleaned_id)
     snap = await doc_ref.get()
     if not snap.exists:
         return {"status": "not_found", "log_id": cleaned_id}

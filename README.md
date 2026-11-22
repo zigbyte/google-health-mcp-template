@@ -41,6 +41,9 @@ Google Cloud Run (your-service.run.app)
 | `log_strength_sets` | Firestore `strength_logs` | Write · Log straight or pyramid sets (reps, weight, RPE) |
 | `get_strength_logs` | Firestore `strength_logs` | Read · Last 14 days (filter by exercise, volume & PRs) |
 | `delete_strength_log` | Firestore `strength_logs` | Delete · Remove a mistyped strength log by `log_id` |
+| `log_mindfulness_session` | Firestore `mindfulness_logs` | Write · Log meditation/mindfulness (duration, Calm %, Stillness %, HR) |
+| `get_mindfulness_logs` | Firestore `mindfulness_logs` | Read · Last 14 days (total minutes, avg Calm/Stillness %) |
+| `delete_mindfulness_log` | Firestore `mindfulness_logs` | Delete · Remove a mindfulness log by `log_id` |
 | `query_health_data_type` | Any v4 `dataType` | Read · Custom filter |
 
 ---
