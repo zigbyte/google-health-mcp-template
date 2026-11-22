@@ -282,11 +282,47 @@ def _build_auth_provider() -> GoogleProvider:
     )
 
 
+READ_ONLY_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+WRITE_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+DELETE_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
+STRENGTH_COLLECTION = os.environ.get("STRENGTH_COLLECTION", "strength_logs")
+_firestore_client: Any = None
+
+
+def _get_firestore_client() -> Any:
+    """Lazily initialize the async Firestore client for strength logs."""
+    global _firestore_client
+    if _firestore_client is None:
+        from google.cloud import firestore
+
+        database = os.environ.get("FIRESTORE_DATABASE", "(default)")
+        _firestore_client = firestore.AsyncClient(database=database)
+    return _firestore_client
+
+
 mcp = FastMCP(
     name="Google Health Bridge",
     instructions=(
-        "Bridge to the user's Google Health API v4 data: read steps, sleep, "
-        "heart rate, daily HRV, exercises, and meals; log meals and water intake. "
+        "Bridge to the user's Google Health API v4 data and personal Firestore strength logs: "
+        "read steps, sleep, heart rate, recovery vitals (RHR, respiratory rate, SpO2, HRV), "
+        "daily energy/TDEE & active zone minutes, body composition, hydration, meals, exercises, "
+        "and combined daily cut summaries; log meals, water intake, and strength training sets. "
         "Dates use YYYY-MM-DD format."
     ),
     auth=_build_auth_provider(),
@@ -387,7 +423,71 @@ async def _fetch_data_points(
     return points
 
 
-@mcp.tool
+async def _rollup_data_points(
+    data_type: str,
+    start_date: str,
+    end_date: str,
+    window_size: str = "86400s",
+) -> list[dict[str, Any]]:
+    """Query Google Health API v4 dataPoints:rollUp, chunking into <=14-day windows."""
+    token = _get_verified_token()
+    url = f"{HEALTH_API_BASE}/users/me/dataTypes/{data_type}/dataPoints:rollUp"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    start_dt = _parse_date(start_date).date()
+    end_exclusive_dt = _parse_date(end_date).date() + timedelta(days=1)
+
+    rollups: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        cursor = start_dt
+        while cursor < end_exclusive_dt:
+            chunk_end = min(end_exclusive_dt, cursor + timedelta(days=14))
+            page_token: str | None = None
+            for _ in range(3):
+                body: dict[str, Any] = {
+                    "range": {
+                        "startTime": f"{cursor.isoformat()}T00:00:00Z",
+                        "endTime": f"{chunk_end.isoformat()}T00:00:00Z",
+                    },
+                    "windowSize": window_size,
+                    "pageSize": 14,
+                }
+                if page_token:
+                    body["pageToken"] = page_token
+
+                resp = await client.post(url, headers=headers, json=body)
+                if resp.status_code == 401:
+                    raise PermissionError(
+                        "Google Health API rejected the token (401). Please re-authenticate."
+                    )
+                if resp.status_code == 403:
+                    raise PermissionError(
+                        f"Google Health API returned 403 Forbidden for '{data_type}:rollUp'."
+                    )
+                resp.raise_for_status()
+
+                payload = resp.json()
+                rollups.extend(payload.get("rollupDataPoints", []))
+                page_token = payload.get("nextPageToken")
+                if not page_token:
+                    break
+            cursor = chunk_end
+
+    return rollups
+
+
+def _format_proto_date(raw: Any) -> str:
+    if isinstance(raw, dict) and raw.get("year"):
+        return f"{int(raw['year']):04d}-{int(raw.get('month', 1)):02d}-{int(raw.get('day', 1)):02d}"
+    if isinstance(raw, str) and len(raw) >= 10:
+        return raw[:10]
+    return "unknown"
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
 async def get_steps(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -424,7 +524,7 @@ async def get_steps(
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
 async def get_sleep(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -449,7 +549,7 @@ async def get_sleep(
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
 async def get_heart_rate(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -500,7 +600,7 @@ async def get_heart_rate(
     return result
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
 async def get_daily_hrv(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -527,7 +627,7 @@ async def get_daily_hrv(
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
 async def get_exercises(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -584,7 +684,7 @@ async def _create_data_point(
         return resp.json()
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
 async def get_meals(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -611,7 +711,7 @@ async def get_meals(
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=WRITE_ANNOTATIONS)
 async def log_meal(
     food_name: str,
     calories_kcal: float,
@@ -690,7 +790,7 @@ async def log_meal(
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=WRITE_ANNOTATIONS)
 async def log_water(
     milliliters: float,
     logged_at: str | None = None,
@@ -729,7 +829,552 @@ async def log_water(
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_hydration(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """
+    Get logged water / hydration intake from Google Health for a date range (YYYY-MM-DD).
+    Defaults to today and yesterday (last 2 days). Returns daily totals in mL and fl oz.
+    """
+    start, end = _default_date_range(start_date, end_date, default_days=2)
+    end_exclusive = _next_day_iso(end)
+    filter_expr = (
+        f'hydration_log.interval.civil_start_time >= "{start}T00:00:00" '
+        f'AND hydration_log.interval.civil_start_time < "{end_exclusive}T00:00:00"'
+    )
+
+    points = await _fetch_data_points(
+        "hydration-log", filter_expr=filter_expr, page_size=200
+    )
+
+    daily_ml: dict[str, float] = defaultdict(float)
+    logs: list[dict[str, Any]] = []
+    for pt in points:
+        hl = pt.get("hydrationLog", {})
+        interval = hl.get("interval", {})
+        civil_date = interval.get("civilStartTime", {}).get("date")
+        day = _format_proto_date(civil_date or interval.get("startTime"))
+        ml = float(hl.get("amountConsumed", {}).get("milliliters") or 0)
+        if ml > 0:
+            daily_ml[day] += ml
+            logs.append(
+                {
+                    "date": day,
+                    "start_time": interval.get("startTime"),
+                    "milliliters": round(ml, 1),
+                    "fl_oz": round(ml / 29.5735, 1),
+                }
+            )
+
+    daily_totals = {
+        day: {
+            "milliliters": round(ml, 1),
+            "liters": round(ml / 1000.0, 2),
+            "fl_oz": round(ml / 29.5735, 1),
+        }
+        for day, ml in sorted(daily_ml.items())
+    }
+    total_ml = round(sum(daily_ml.values()), 1)
+    return {
+        "start_date": start,
+        "end_date": end,
+        "total_milliliters": total_ml,
+        "total_fl_oz": round(total_ml / 29.5735, 1),
+        "daily_totals": daily_totals,
+        "log_count": len(logs),
+        "logs": logs,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_recovery_vitals(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """
+    Get dedicated daily recovery vitals from Google Health in one call:
+    Resting Heart Rate (bpm), Respiratory Rate (breaths/min), SpO2 (%), and HRV (RMSSD ms).
+    Defaults to the last 14 days.
+    """
+    start, end = _default_date_range(start_date, end_date, default_days=14)
+    end_exclusive = _next_day_iso(end)
+
+    async def _safe_daily(dt: str) -> list[dict[str, Any]]:
+        prefix = dt.replace("-", "_")
+        flt = f'{prefix}.date >= "{start}" AND {prefix}.date < "{end_exclusive}"'
+        try:
+            return await _fetch_data_points(dt, filter_expr=flt, page_size=100, max_pages=1)
+        except Exception:
+            return []
+
+    rhr_pts, resp_pts, spo2_pts, hrv_pts = await asyncio.gather(
+        _safe_daily("daily-resting-heart-rate"),
+        _safe_daily("daily-respiratory-rate"),
+        _safe_daily("daily-oxygen-saturation"),
+        _safe_daily("daily-heart-rate-variability"),
+    )
+
+    by_day: dict[str, dict[str, Any]] = defaultdict(dict)
+
+    for pt in rhr_pts:
+        obj = pt.get("dailyRestingHeartRate", {})
+        day = _format_proto_date(obj.get("date"))
+        bpm = obj.get("beatsPerMinute")
+        if bpm is not None:
+            by_day[day]["resting_hr_bpm"] = round(float(bpm), 1)
+
+    for pt in resp_pts:
+        obj = pt.get("dailyRespiratoryRate", {})
+        day = _format_proto_date(obj.get("date"))
+        rate = (
+            obj.get("breathsPerMinute")
+            or obj.get("averageBreathsPerMinute")
+            or obj.get("fullSleepSummary", {}).get("breathsPerMinute")
+        )
+        if rate is not None:
+            by_day[day]["respiratory_rate_brpm"] = round(float(rate), 1)
+        elif obj:
+            by_day[day]["respiratory_rate_raw"] = obj
+
+    for pt in spo2_pts:
+        obj = pt.get("dailyOxygenSaturation", {})
+        day = _format_proto_date(obj.get("date"))
+        pct = obj.get("averagePercentage") or obj.get("averageSaturationPercentage")
+        if pct is not None:
+            by_day[day]["spo2_pct"] = round(float(pct), 1)
+
+    for pt in hrv_pts:
+        obj = pt.get("dailyHeartRateVariability", {})
+        day = _format_proto_date(obj.get("date"))
+        ms = obj.get("averageHeartRateVariabilityMillis") or obj.get("rmssdMillis")
+        if ms is not None:
+            by_day[day]["hrv_rmssd_ms"] = round(float(ms), 1)
+        non_rem = obj.get("nonRemHeartRateBeatsPerMinute")
+        if non_rem is not None:
+            by_day[day]["non_rem_hr_bpm"] = round(float(non_rem), 1)
+
+    ordered = dict(sorted(by_day.items()))
+    return {
+        "start_date": start,
+        "end_date": end,
+        "days_with_data": len(ordered),
+        "daily_vitals": ordered,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_daily_energy(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """
+    Get daily Total Daily Energy Expenditure (TDEE in kcal via total-calories:rollUp),
+    Active Zone Minutes (AZM), and Active Minutes for a date range (YYYY-MM-DD).
+    Defaults to the last 7 days.
+    """
+    start, end = _default_date_range(start_date, end_date, default_days=7)
+    end_exclusive = _next_day_iso(end)
+
+    async def _safe_azm() -> list[dict[str, Any]]:
+        flt = (
+            f'active_zone_minutes.interval.start_time >= "{start}T00:00:00Z" '
+            f'AND active_zone_minutes.interval.start_time < "{end_exclusive}T00:00:00Z"'
+        )
+        try:
+            return await _fetch_data_points(
+                "active-zone-minutes", filter_expr=flt, page_size=2000, max_pages=2
+            )
+        except Exception:
+            return []
+
+    async def _safe_active() -> list[dict[str, Any]]:
+        flt = (
+            f'active_minutes.interval.start_time >= "{start}T00:00:00Z" '
+            f'AND active_minutes.interval.start_time < "{end_exclusive}T00:00:00Z"'
+        )
+        try:
+            return await _fetch_data_points(
+                "active-minutes", filter_expr=flt, page_size=2000, max_pages=2
+            )
+        except Exception:
+            return []
+
+    cal_rollups, azm_pts, active_pts = await asyncio.gather(
+        _rollup_data_points("total-calories", start, end, window_size="86400s"),
+        _safe_azm(),
+        _safe_active(),
+    )
+
+    by_day: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"tdee_kcal": 0.0, "active_zone_minutes": 0, "active_minutes": 0}
+    )
+
+    for rp in cal_rollups:
+        ts = rp.get("startTime") or rp.get("range", {}).get("startTime") or ""
+        day = ts[:10] if len(ts) >= 10 else "unknown"
+        tc = rp.get("totalCalories", {})
+        kcal = float(tc.get("kcalSum") or tc.get("kcal") or 0)
+        by_day[day]["tdee_kcal"] = round(by_day[day]["tdee_kcal"] + kcal, 1)
+
+    for pt in azm_pts:
+        obj = pt.get("activeZoneMinutes", {})
+        ts = obj.get("interval", {}).get("startTime") or ""
+        day = ts[:10] if len(ts) >= 10 else "unknown"
+        mins = int(obj.get("activeZoneMinutes") or obj.get("minutes") or 0)
+        by_day[day]["active_zone_minutes"] += mins
+
+    for pt in active_pts:
+        obj = pt.get("activeMinutes", {})
+        ts = obj.get("interval", {}).get("startTime") or ""
+        day = ts[:10] if len(ts) >= 10 else "unknown"
+        mins = int(obj.get("minutes") or 0)
+        by_day[day]["active_minutes"] += mins
+
+    ordered = dict(sorted(by_day.items()))
+    return {
+        "start_date": start,
+        "end_date": end,
+        "daily_energy": ordered,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_body_composition(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """
+    Get weight (lbs and kg) and body fat percentage records from Google Health.
+    Defaults to the last 30 days.
+    """
+    start, end = _default_date_range(start_date, end_date, default_days=30)
+    end_exclusive = _next_day_iso(end)
+
+    weight_flt = (
+        f'weight.sample_time.physical_time >= "{start}T00:00:00Z" '
+        f'AND weight.sample_time.physical_time < "{end_exclusive}T00:00:00Z"'
+    )
+    bf_flt = (
+        f'body_fat.sample_time.physical_time >= "{start}T00:00:00Z" '
+        f'AND body_fat.sample_time.physical_time < "{end_exclusive}T00:00:00Z"'
+    )
+
+    async def _safe_bf() -> list[dict[str, Any]]:
+        try:
+            return await _fetch_data_points("body-fat", filter_expr=bf_flt, page_size=200, max_pages=1)
+        except Exception:
+            return []
+
+    weight_pts, bf_pts = await asyncio.gather(
+        _fetch_data_points("weight", filter_expr=weight_flt, page_size=200, max_pages=1),
+        _safe_bf(),
+    )
+
+    weights: list[dict[str, Any]] = []
+    for pt in weight_pts:
+        w = pt.get("weight", {})
+        grams = w.get("weightGrams")
+        if grams is not None:
+            kg = float(grams) / 1000.0
+            ts = w.get("sampleTime", {}).get("physicalTime") or ""
+            weights.append(
+                {
+                    "date": ts[:10] if len(ts) >= 10 else "unknown",
+                    "timestamp": ts,
+                    "weight_lbs": round(kg * 2.20462262, 2),
+                    "weight_kg": round(kg, 2),
+                }
+            )
+    weights.sort(key=lambda x: x["timestamp"])
+
+    body_fat: list[dict[str, Any]] = []
+    for pt in bf_pts:
+        bf = pt.get("bodyFat", {})
+        pct = bf.get("percentage") or bf.get("bodyFatPercentage")
+        ts = bf.get("sampleTime", {}).get("physicalTime") or ""
+        if pct is not None:
+            body_fat.append(
+                {
+                    "date": ts[:10] if len(ts) >= 10 else "unknown",
+                    "timestamp": ts,
+                    "body_fat_pct": round(float(pct), 2),
+                }
+            )
+    body_fat.sort(key=lambda x: x["timestamp"])
+
+    change_lbs = (
+        round(weights[-1]["weight_lbs"] - weights[0]["weight_lbs"], 2)
+        if len(weights) >= 2
+        else None
+    )
+    return {
+        "start_date": start,
+        "end_date": end,
+        "latest_weight_lbs": weights[-1]["weight_lbs"] if weights else None,
+        "latest_weight_kg": weights[-1]["weight_kg"] if weights else None,
+        "weight_change_lbs": change_lbs,
+        "weight_count": len(weights),
+        "weights": weights,
+        "body_fat_count": len(body_fat),
+        "body_fat": body_fat,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_daily_cut_summary(
+    days: int = 7,
+) -> dict[str, Any]:
+    """
+    One-stop daily summary combining TDEE (total calories burned), nutrition intake & macros,
+    exact net caloric deficit, hydration, weight, and recovery vitals (RHR, resp rate, SpO2, HRV).
+    Defaults to the last 7 days (max 14).
+    """
+    clamped_days = max(1, min(int(days), 14))
+    start, end = _default_date_range(None, None, default_days=clamped_days)
+
+    energy_fn = getattr(get_daily_energy, "fn", get_daily_energy)
+    meals_fn = getattr(get_meals, "fn", get_meals)
+    hydration_fn = getattr(get_hydration, "fn", get_hydration)
+    body_fn = getattr(get_body_composition, "fn", get_body_composition)
+    recovery_fn = getattr(get_recovery_vitals, "fn", get_recovery_vitals)
+
+    energy_res, meals_res, hydration_res, body_res, recovery_res = await asyncio.gather(
+        energy_fn(start_date=start, end_date=end),
+        meals_fn(start_date=start, end_date=end),
+        hydration_fn(start_date=start, end_date=end),
+        body_fn(start_date=start, end_date=end),
+        recovery_fn(start_date=start, end_date=end),
+    )
+
+    by_day: dict[str, dict[str, Any]] = defaultdict(dict)
+
+    for day, e in energy_res.get("daily_energy", {}).items():
+        by_day[day]["tdee_kcal"] = e.get("tdee_kcal", 0.0)
+        by_day[day]["active_zone_minutes"] = e.get("active_zone_minutes", 0)
+
+    # Aggregate meals per day
+    meal_agg: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "count": 0}
+    )
+    for pt in meals_res.get("meals", []):
+        nl = pt.get("nutritionLog", {})
+        interval = nl.get("interval", {})
+        day = _format_proto_date(
+            interval.get("civilStartTime", {}).get("date") or interval.get("startTime")
+        )
+        meal_agg[day]["kcal"] += float(nl.get("energy", {}).get("kcal") or 0)
+        meal_agg[day]["carbs_g"] += float(nl.get("totalCarbohydrate", {}).get("grams") or 0)
+        meal_agg[day]["fat_g"] += float(nl.get("totalFat", {}).get("grams") or 0)
+        for n in nl.get("nutrients", []):
+            if str(n.get("nutrient", "")).upper() == "PROTEIN":
+                meal_agg[day]["protein_g"] += float(n.get("quantity", {}).get("grams") or 0)
+        meal_agg[day]["count"] += 1
+
+    for day, m in meal_agg.items():
+        by_day[day]["intake_kcal"] = round(m["kcal"], 1)
+        by_day[day]["protein_g"] = round(m["protein_g"], 1)
+        by_day[day]["carbs_g"] = round(m["carbs_g"], 1)
+        by_day[day]["fat_g"] = round(m["fat_g"], 1)
+        by_day[day]["meal_count"] = int(m["count"])
+
+    for day, h in hydration_res.get("daily_totals", {}).items():
+        by_day[day]["water_ml"] = h["milliliters"]
+        by_day[day]["water_fl_oz"] = h["fl_oz"]
+
+    for w in body_res.get("weights", []):
+        by_day[w["date"]]["weight_lbs"] = w["weight_lbs"]
+
+    for day, v in recovery_res.get("daily_vitals", {}).items():
+        by_day[day].update(v)
+
+    for day, d in by_day.items():
+        if "tdee_kcal" in d and "intake_kcal" in d:
+            d["net_deficit_kcal"] = round(d["tdee_kcal"] - d["intake_kcal"], 1)
+
+    return {
+        "start_date": start,
+        "end_date": end,
+        "latest_weight_lbs": body_res.get("latest_weight_lbs"),
+        "daily_summary": dict(sorted(by_day.items())),
+    }
+
+
+@mcp.tool(annotations=WRITE_ANNOTATIONS)
+async def log_strength_sets(
+    exercise: str,
+    sets: int | list[dict[str, Any]],
+    reps: int | None = None,
+    weight_lbs: float | None = None,
+    weight_kg: float | None = None,
+    rpe: float | None = None,
+    notes: str | None = None,
+    logged_at: str | None = None,
+) -> dict[str, Any]:
+    """
+    Log strength-training sets (exercise, reps, weight, RPE) to Firestore (`strength_logs`).
+
+    Supports two styles:
+    - Straight sets: sets=3, reps=10, weight_lbs=135, rpe=8
+    - Variable/pyramid sets: sets=[{"reps": 10, "weight_lbs": 135}, {"reps": 8, "weight_lbs": 145, "rpe": 9}]
+    """
+    _get_verified_token()
+
+    exercise_clean = exercise.strip()
+    if not exercise_clean:
+        raise ValueError("exercise name is required.")
+
+    normalized_sets: list[dict[str, Any]] = []
+    if isinstance(sets, int):
+        if sets < 1 or sets > 30:
+            raise ValueError("sets count must be between 1 and 30.")
+        if reps is None or reps < 1:
+            raise ValueError("reps must be provided when sets is an integer.")
+        w_lbs = (
+            round(float(weight_lbs), 2)
+            if weight_lbs is not None
+            else (round(float(weight_kg) * 2.20462262, 2) if weight_kg is not None else 0.0)
+        )
+        for _ in range(sets):
+            entry: dict[str, Any] = {"reps": int(reps), "weight_lbs": w_lbs}
+            if rpe is not None:
+                entry["rpe"] = round(float(rpe), 1)
+            normalized_sets.append(entry)
+    elif isinstance(sets, list) and len(sets) > 0:
+        for item in sets:
+            r = int(item.get("reps") or reps or 0)
+            if r < 1:
+                raise ValueError("Each set must include a positive 'reps' count.")
+            if item.get("weight_lbs") is not None:
+                w_lbs = round(float(item["weight_lbs"]), 2)
+            elif item.get("weight_kg") is not None:
+                w_lbs = round(float(item["weight_kg"]) * 2.20462262, 2)
+            elif weight_lbs is not None:
+                w_lbs = round(float(weight_lbs), 2)
+            elif weight_kg is not None:
+                w_lbs = round(float(weight_kg) * 2.20462262, 2)
+            else:
+                w_lbs = 0.0
+            entry = {"reps": r, "weight_lbs": w_lbs}
+            set_rpe = item.get("rpe", rpe)
+            if set_rpe is not None:
+                entry["rpe"] = round(float(set_rpe), 1)
+            normalized_sets.append(entry)
+    else:
+        raise ValueError("sets must be a positive integer or a non-empty list of set objects.")
+
+    if logged_at:
+        dt = datetime.fromisoformat(logged_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+
+    total_reps = sum(s["reps"] for s in normalized_sets)
+    total_volume = round(sum(s["reps"] * s["weight_lbs"] for s in normalized_sets), 1)
+    top_weight = max((s["weight_lbs"] for s in normalized_sets), default=0.0)
+
+    doc: dict[str, Any] = {
+        "date": dt.date().isoformat(),
+        "logged_at": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "exercise": exercise_clean,
+        "exercise_key": exercise_clean.lower(),
+        "sets": normalized_sets,
+        "total_sets": len(normalized_sets),
+        "total_reps": total_reps,
+        "total_volume_lbs": total_volume,
+        "top_weight_lbs": top_weight,
+    }
+    if notes:
+        doc["notes"] = notes.strip()
+
+    db = _get_firestore_client()
+    _, doc_ref = await db.collection(STRENGTH_COLLECTION).add(doc)
+    return {
+        "status": "logged",
+        "log_id": doc_ref.id,
+        "entry": doc,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_strength_logs(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    exercise: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """
+    Read logged strength-training sets from Firestore (`strength_logs`).
+    Defaults to the last 14 days. Optionally filter by exercise substring (case-insensitive).
+    """
+    _get_verified_token()
+    start, end = _default_date_range(start_date, end_date, default_days=14)
+    clamped_limit = max(1, min(int(limit), 200))
+
+    db = _get_firestore_client()
+    query = (
+        db.collection(STRENGTH_COLLECTION)
+        .where("date", ">=", start)
+        .where("date", "<=", end)
+    )
+
+    entries: list[dict[str, Any]] = []
+    exercise_filter = exercise.strip().lower() if exercise else None
+    async for snap in query.stream():
+        data = snap.to_dict() or {}
+        if exercise_filter and exercise_filter not in str(data.get("exercise_key", "")):
+            continue
+        entries.append({"log_id": snap.id, **data})
+
+    entries.sort(key=lambda x: str(x.get("logged_at", "")), reverse=True)
+    entries = entries[:clamped_limit]
+
+    by_exercise: dict[str, dict[str, Any]] = {}
+    for e in entries:
+        name = str(e.get("exercise", "Unknown"))
+        agg = by_exercise.setdefault(
+            name,
+            {"sessions": 0, "total_sets": 0, "total_volume_lbs": 0.0, "top_weight_lbs": 0.0},
+        )
+        agg["sessions"] += 1
+        agg["total_sets"] += int(e.get("total_sets") or 0)
+        agg["total_volume_lbs"] = round(
+            agg["total_volume_lbs"] + float(e.get("total_volume_lbs") or 0), 1
+        )
+        agg["top_weight_lbs"] = max(agg["top_weight_lbs"], float(e.get("top_weight_lbs") or 0))
+
+    return {
+        "start_date": start,
+        "end_date": end,
+        "log_count": len(entries),
+        "exercise_summary": by_exercise,
+        "logs": entries,
+    }
+
+
+@mcp.tool(annotations=DELETE_ANNOTATIONS)
+async def delete_strength_log(log_id: str) -> dict[str, Any]:
+    """
+    Delete a previously logged strength-training entry from Firestore by its `log_id`.
+    """
+    _get_verified_token()
+    cleaned_id = log_id.strip()
+    if not cleaned_id:
+        raise ValueError("log_id is required.")
+
+    db = _get_firestore_client()
+    doc_ref = db.collection(STRENGTH_COLLECTION).document(cleaned_id)
+    snap = await doc_ref.get()
+    if not snap.exists:
+        return {"status": "not_found", "log_id": cleaned_id}
+    await doc_ref.delete()
+    return {"status": "deleted", "log_id": cleaned_id}
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
 async def query_health_data_type(
     data_type: str,
     filter_expr: str | None = None,

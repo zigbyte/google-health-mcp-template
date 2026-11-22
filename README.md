@@ -31,8 +31,16 @@ Google Cloud Run (your-service.run.app)
 | `get_daily_hrv` | `daily-heart-rate-variability` | Read · Last 14 days |
 | `get_exercises` | `exercise` | Read · Last 14 days |
 | `get_meals` | `nutrition-log` | Read · Last 2 days |
+| `get_hydration` | `hydration-log` | Read · Last 2 days (daily mL & fl oz) |
+| `get_recovery_vitals` | `daily-resting-heart-rate`, `daily-respiratory-rate`, `daily-oxygen-saturation`, `daily-heart-rate-variability` | Read · Last 14 days (merged daily) |
+| `get_daily_energy` | `total-calories:rollUp`, `active-zone-minutes`, `active-minutes` | Read · Last 7 days (TDEE & AZM) |
+| `get_body_composition` | `weight`, `body-fat` | Read · Last 30 days (lbs/kg & body fat %) |
+| `get_daily_cut_summary` | Combined TDEE + meals + hydration + weight + recovery | Read · Last 7 days (1-call net deficit & readiness) |
 | `log_meal` | `nutrition-log` | Write · Log food, calories, macros, meal type |
 | `log_water` | `hydration-log` | Write · Log water intake (mL) |
+| `log_strength_sets` | Firestore `strength_logs` | Write · Log straight or pyramid sets (reps, weight, RPE) |
+| `get_strength_logs` | Firestore `strength_logs` | Read · Last 14 days (filter by exercise, volume & PRs) |
+| `delete_strength_log` | Firestore `strength_logs` | Delete · Remove a mistyped strength log by `log_id` |
 | `query_health_data_type` | Any v4 `dataType` | Read · Custom filter |
 
 ---
