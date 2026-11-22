@@ -44,6 +44,10 @@ Google Cloud Run (your-service.run.app)
 | `log_mindfulness_session` | Firestore `mindfulness_logs` | Write · Log meditation/mindfulness (duration, Calm %, Stillness %, HR) |
 | `get_mindfulness_logs` | Firestore `mindfulness_logs` | Read · Last 14 days (total minutes, avg Calm/Stillness %) |
 | `delete_mindfulness_log` | Firestore `mindfulness_logs` | Delete · Remove a mindfulness log by `log_id` |
+| `delete_meals` | `nutrition-log` (`:batchDelete`) | Delete · Remove duplicate/mistyped meals by resource `name` |
+| `delete_hydration_logs` | `hydration-log` (`:batchDelete`) | Delete · Remove duplicate/mistyped water logs by resource `name` |
+| `log_daily_checkin` | Firestore `daily_checkins` | Write · Daily soreness (0-10), cramp warning, energy, waist (in/cm), notes |
+| `get_daily_checkins` | Firestore `daily_checkins` | Read · Last 30 days readiness check-ins & latest waist |
 | `query_health_data_type` | Any v4 `dataType` | Read · Custom filter |
 
 ---

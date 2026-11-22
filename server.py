@@ -18,6 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode
+from zoneinfo import ZoneInfo
 
 import httpx
 import uvicorn
@@ -303,6 +304,9 @@ DELETE_ANNOTATIONS = {
 
 STRENGTH_COLLECTION = os.environ.get("STRENGTH_COLLECTION", "strength_logs")
 MINDFULNESS_COLLECTION = os.environ.get("MINDFULNESS_COLLECTION", "mindfulness_logs")
+CHECKIN_COLLECTION = os.environ.get("CHECKIN_COLLECTION", "daily_checkins")
+USER_TIMEZONE_NAME = os.environ.get("USER_TIMEZONE", "UTC").strip() or "UTC"
+USER_TZ = ZoneInfo(USER_TIMEZONE_NAME)
 _firestore_client: Any = None
 
 
@@ -358,7 +362,7 @@ def _parse_date(date_str: str) -> datetime:
 def _default_date_range(
     start_date: str | None, end_date: str | None, default_days: int = 7
 ) -> tuple[str, str]:
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(USER_TZ).date()
     if not end_date:
         end_dt = today
     else:
@@ -377,6 +381,29 @@ def _default_date_range(
 
 def _next_day_iso(date_str: str) -> str:
     return (_parse_date(date_str).date() + timedelta(days=1)).isoformat()
+
+
+def _utc_bounds_for_local_dates(start_date: str, end_date: str) -> tuple[str, str]:
+    """Convert inclusive local YYYY-MM-DD bounds to [start_utc, end_exclusive_utc) ISO strings."""
+    s = _parse_date(start_date).replace(tzinfo=USER_TZ)
+    e = (_parse_date(end_date) + timedelta(days=1)).replace(tzinfo=USER_TZ)
+    return (
+        s.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        e.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
+def _iso_to_local_date(ts: str) -> str:
+    """Convert an ISO-8601 timestamp string into a YYYY-MM-DD date in USER_TZ."""
+    if not ts:
+        return "unknown"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(USER_TZ).date().isoformat()
+    except ValueError:
+        return ts[:10] if len(ts) >= 10 else "unknown"
 
 
 async def _fetch_data_points(
@@ -446,12 +473,22 @@ async def _rollup_data_points(
         cursor = start_dt
         while cursor < end_exclusive_dt:
             chunk_end = min(end_exclusive_dt, cursor + timedelta(days=14))
+            chunk_start_utc = (
+                datetime(cursor.year, cursor.month, cursor.day, tzinfo=USER_TZ)
+                .astimezone(timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            chunk_end_utc = (
+                datetime(chunk_end.year, chunk_end.month, chunk_end.day, tzinfo=USER_TZ)
+                .astimezone(timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
             page_token: str | None = None
             for _ in range(3):
                 body: dict[str, Any] = {
                     "range": {
-                        "startTime": f"{cursor.isoformat()}T00:00:00Z",
-                        "endTime": f"{chunk_end.isoformat()}T00:00:00Z",
+                        "startTime": chunk_start_utc,
+                        "endTime": chunk_end_utc,
                     },
                     "windowSize": window_size,
                     "pageSize": 14,
@@ -498,10 +535,10 @@ async def get_steps(
     Defaults to the last 7 days if dates are omitted.
     """
     start, end = _default_date_range(start_date, end_date, default_days=7)
-    end_exclusive = _next_day_iso(end)
+    start_utc, end_utc = _utc_bounds_for_local_dates(start, end)
     filter_expr = (
-        f'steps.interval.start_time >= "{start}T00:00:00Z" '
-        f'AND steps.interval.start_time < "{end_exclusive}T00:00:00Z"'
+        f'steps.interval.start_time >= "{start_utc}" '
+        f'AND steps.interval.start_time < "{end_utc}"'
     )
 
     points = await _fetch_data_points("steps", filter_expr=filter_expr, page_size=5000)
@@ -510,13 +547,14 @@ async def get_steps(
     for pt in points:
         steps_obj = pt.get("steps", {})
         interval = steps_obj.get("interval", {})
-        ts = interval.get("startTime") or interval.get("civilStartTime") or ""
-        day = ts[:10] if len(ts) >= 10 else "unknown"
+        ts = interval.get("startTime") or ""
+        day = _iso_to_local_date(ts) if ts else _format_proto_date(interval.get("civilStartTime", {}).get("date"))
         count = steps_obj.get("count") or steps_obj.get("countSum") or 0
         daily_totals[day] += int(count)
 
     ordered = dict(sorted(daily_totals.items()))
     return {
+        "timezone": USER_TIMEZONE_NAME,
         "start_date": start,
         "end_date": end,
         "total_steps": sum(ordered.values()),
@@ -561,10 +599,10 @@ async def get_heart_rate(
     Defaults to the last 3 days. Set include_samples=True to include up to 200 raw samples.
     """
     start, end = _default_date_range(start_date, end_date, default_days=3)
-    end_exclusive = _next_day_iso(end)
+    start_utc, end_utc = _utc_bounds_for_local_dates(start, end)
     filter_expr = (
-        f'heart_rate.sample_time.physical_time >= "{start}T00:00:00Z" '
-        f'AND heart_rate.sample_time.physical_time < "{end_exclusive}T00:00:00Z"'
+        f'heart_rate.sample_time.physical_time >= "{start_utc}" '
+        f'AND heart_rate.sample_time.physical_time < "{end_utc}"'
     )
 
     points = await _fetch_data_points(
@@ -575,8 +613,8 @@ async def get_heart_rate(
     for pt in points:
         hr = pt.get("heartRate", {})
         sample_time = hr.get("sampleTime", {})
-        ts = sample_time.get("physicalTime") or sample_time.get("civilTime") or ""
-        day = ts[:10] if len(ts) >= 10 else "unknown"
+        ts = sample_time.get("physicalTime") or ""
+        day = _iso_to_local_date(ts) if ts else _format_proto_date(sample_time.get("civilTime", {}).get("date"))
         bpm = hr.get("beatsPerMinute")
         if bpm is not None:
             by_day[day].append(float(bpm))
@@ -591,6 +629,7 @@ async def get_heart_rate(
         }
 
     result: dict[str, Any] = {
+        "timezone": USER_TIMEZONE_NAME,
         "start_date": start,
         "end_date": end,
         "daily_summary": daily_summary,
@@ -862,6 +901,7 @@ async def get_hydration(
             daily_ml[day] += ml
             logs.append(
                 {
+                    "name": pt.get("name"),
                     "date": day,
                     "start_time": interval.get("startTime"),
                     "milliliters": round(ml, 1),
@@ -976,12 +1016,12 @@ async def get_daily_energy(
     Defaults to the last 7 days.
     """
     start, end = _default_date_range(start_date, end_date, default_days=7)
-    end_exclusive = _next_day_iso(end)
+    start_utc, end_utc = _utc_bounds_for_local_dates(start, end)
 
     async def _safe_azm() -> list[dict[str, Any]]:
         flt = (
-            f'active_zone_minutes.interval.start_time >= "{start}T00:00:00Z" '
-            f'AND active_zone_minutes.interval.start_time < "{end_exclusive}T00:00:00Z"'
+            f'active_zone_minutes.interval.start_time >= "{start_utc}" '
+            f'AND active_zone_minutes.interval.start_time < "{end_utc}"'
         )
         try:
             return await _fetch_data_points(
@@ -992,8 +1032,8 @@ async def get_daily_energy(
 
     async def _safe_active() -> list[dict[str, Any]]:
         flt = (
-            f'active_minutes.interval.start_time >= "{start}T00:00:00Z" '
-            f'AND active_minutes.interval.start_time < "{end_exclusive}T00:00:00Z"'
+            f'active_minutes.interval.start_time >= "{start_utc}" '
+            f'AND active_minutes.interval.start_time < "{end_utc}"'
         )
         try:
             return await _fetch_data_points(
@@ -1014,7 +1054,7 @@ async def get_daily_energy(
 
     for rp in cal_rollups:
         ts = rp.get("startTime") or rp.get("range", {}).get("startTime") or ""
-        day = ts[:10] if len(ts) >= 10 else "unknown"
+        day = _iso_to_local_date(ts)
         tc = rp.get("totalCalories", {})
         kcal = float(tc.get("kcalSum") or tc.get("kcal") or 0)
         by_day[day]["tdee_kcal"] = round(by_day[day]["tdee_kcal"] + kcal, 1)
@@ -1022,19 +1062,20 @@ async def get_daily_energy(
     for pt in azm_pts:
         obj = pt.get("activeZoneMinutes", {})
         ts = obj.get("interval", {}).get("startTime") or ""
-        day = ts[:10] if len(ts) >= 10 else "unknown"
+        day = _iso_to_local_date(ts)
         mins = int(obj.get("activeZoneMinutes") or obj.get("minutes") or 0)
         by_day[day]["active_zone_minutes"] += mins
 
     for pt in active_pts:
         obj = pt.get("activeMinutes", {})
         ts = obj.get("interval", {}).get("startTime") or ""
-        day = ts[:10] if len(ts) >= 10 else "unknown"
+        day = _iso_to_local_date(ts)
         mins = int(obj.get("minutes") or 0)
         by_day[day]["active_minutes"] += mins
 
     ordered = dict(sorted(by_day.items()))
     return {
+        "timezone": USER_TIMEZONE_NAME,
         "start_date": start,
         "end_date": end,
         "daily_energy": ordered,
@@ -1051,15 +1092,15 @@ async def get_body_composition(
     Defaults to the last 30 days.
     """
     start, end = _default_date_range(start_date, end_date, default_days=30)
-    end_exclusive = _next_day_iso(end)
+    start_utc, end_utc = _utc_bounds_for_local_dates(start, end)
 
     weight_flt = (
-        f'weight.sample_time.physical_time >= "{start}T00:00:00Z" '
-        f'AND weight.sample_time.physical_time < "{end_exclusive}T00:00:00Z"'
+        f'weight.sample_time.physical_time >= "{start_utc}" '
+        f'AND weight.sample_time.physical_time < "{end_utc}"'
     )
     bf_flt = (
-        f'body_fat.sample_time.physical_time >= "{start}T00:00:00Z" '
-        f'AND body_fat.sample_time.physical_time < "{end_exclusive}T00:00:00Z"'
+        f'body_fat.sample_time.physical_time >= "{start_utc}" '
+        f'AND body_fat.sample_time.physical_time < "{end_utc}"'
     )
 
     async def _safe_bf() -> list[dict[str, Any]]:
@@ -1140,13 +1181,23 @@ async def get_daily_cut_summary(
     hydration_fn = getattr(get_hydration, "fn", get_hydration)
     body_fn = getattr(get_body_composition, "fn", get_body_composition)
     recovery_fn = getattr(get_recovery_vitals, "fn", get_recovery_vitals)
+    checkins_fn = getattr(get_daily_checkins, "fn", get_daily_checkins)
 
-    energy_res, meals_res, hydration_res, body_res, recovery_res = await asyncio.gather(
-        energy_fn(start_date=start, end_date=end),
-        meals_fn(start_date=start, end_date=end),
-        hydration_fn(start_date=start, end_date=end),
-        body_fn(start_date=start, end_date=end),
-        recovery_fn(start_date=start, end_date=end),
+    async def _safe_checkins() -> dict[str, Any]:
+        try:
+            return await checkins_fn(start_date=start, end_date=end)
+        except Exception:
+            return {"checkins": []}
+
+    energy_res, meals_res, hydration_res, body_res, recovery_res, checkins_res = (
+        await asyncio.gather(
+            energy_fn(start_date=start, end_date=end),
+            meals_fn(start_date=start, end_date=end),
+            hydration_fn(start_date=start, end_date=end),
+            body_fn(start_date=start, end_date=end),
+            recovery_fn(start_date=start, end_date=end),
+            _safe_checkins(),
+        )
     )
 
     by_day: dict[str, dict[str, Any]] = defaultdict(dict)
@@ -1155,17 +1206,28 @@ async def get_daily_cut_summary(
         by_day[day]["tdee_kcal"] = e.get("tdee_kcal", 0.0)
         by_day[day]["active_zone_minutes"] = e.get("active_zone_minutes", 0)
 
-    # Aggregate meals per day
+    # Aggregate meals per day with exact-duplicate filtering
     meal_agg: dict[str, dict[str, float]] = defaultdict(
         lambda: {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "count": 0}
     )
+    seen_meals: set[tuple[str, str, int, str]] = set()
+    duplicate_meals_filtered = 0
     for pt in meals_res.get("meals", []):
         nl = pt.get("nutritionLog", {})
         interval = nl.get("interval", {})
         day = _format_proto_date(
             interval.get("civilStartTime", {}).get("date") or interval.get("startTime")
         )
-        meal_agg[day]["kcal"] += float(nl.get("energy", {}).get("kcal") or 0)
+        food_key = str(nl.get("foodDisplayName") or nl.get("food") or "").strip().lower()
+        kcal_val = float(nl.get("energy", {}).get("kcal") or 0)
+        start_min = str(interval.get("startTime") or "")[:16]
+        sig = (day, food_key, round(kcal_val), start_min)
+        if food_key and sig in seen_meals:
+            duplicate_meals_filtered += 1
+            continue
+        seen_meals.add(sig)
+
+        meal_agg[day]["kcal"] += kcal_val
         meal_agg[day]["carbs_g"] += float(nl.get("totalCarbohydrate", {}).get("grams") or 0)
         meal_agg[day]["fat_g"] += float(nl.get("totalFat", {}).get("grams") or 0)
         for n in nl.get("nutrients", []):
@@ -1190,14 +1252,31 @@ async def get_daily_cut_summary(
     for day, v in recovery_res.get("daily_vitals", {}).items():
         by_day[day].update(v)
 
+    latest_waist_in: float | None = None
+    for c in checkins_res.get("checkins", []):
+        c_day = str(c.get("date") or "")
+        if c_day:
+            checkin_summary = {
+                k: v
+                for k, v in c.items()
+                if k in ("soreness", "muscle_soreness", "cramp_warning", "energy_level", "waist_in", "waist_cm", "notes")
+            }
+            if checkin_summary:
+                by_day[c_day]["checkin"] = checkin_summary
+        if latest_waist_in is None and c.get("waist_in") is not None:
+            latest_waist_in = float(c["waist_in"])
+
     for day, d in by_day.items():
         if "tdee_kcal" in d and "intake_kcal" in d:
             d["net_deficit_kcal"] = round(d["tdee_kcal"] - d["intake_kcal"], 1)
 
     return {
+        "timezone": USER_TIMEZONE_NAME,
         "start_date": start,
         "end_date": end,
         "latest_weight_lbs": body_res.get("latest_weight_lbs"),
+        "latest_waist_in": latest_waist_in,
+        "duplicate_meals_filtered": duplicate_meals_filtered,
         "daily_summary": dict(sorted(by_day.items())),
     }
 
@@ -1506,6 +1585,162 @@ async def delete_mindfulness_log(log_id: str) -> dict[str, Any]:
         return {"status": "not_found", "log_id": cleaned_id}
     await doc_ref.delete()
     return {"status": "deleted", "log_id": cleaned_id}
+
+
+async def _batch_delete_data_points(
+    data_type: str,
+    names: list[str],
+) -> dict[str, Any]:
+    """Delete one or more Google Health API v4 dataPoints via :batchDelete."""
+    token = _get_verified_token()
+    cleaned = [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    if not cleaned:
+        raise ValueError("At least one non-empty dataPoint resource name is required.")
+
+    url = f"{HEALTH_API_BASE}/users/me/dataTypes/{data_type}/dataPoints:batchDelete"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, headers=headers, json={"names": cleaned})
+        if resp.status_code == 401:
+            raise PermissionError(
+                "Google Health API rejected the token (401). Please re-authenticate."
+            )
+        if resp.status_code == 403:
+            raise PermissionError(
+                f"Google Health API returned 403 Forbidden deleting '{data_type}'."
+            )
+        if resp.status_code >= 400:
+            raise ValueError(
+                f"Google Health API returned {resp.status_code} deleting '{data_type}': {resp.text}"
+            )
+        return {"status": "deleted", "deleted_count": len(cleaned), "names": cleaned}
+
+
+@mcp.tool(annotations=DELETE_ANNOTATIONS)
+async def delete_meals(data_point_names: list[str]) -> dict[str, Any]:
+    """
+    Delete one or more duplicate/mistyped meal entries from Google Health (`nutrition-log`).
+    Pass the `name` field(s) returned by `get_meals` (e.g., ["users/.../dataTypes/nutrition-log/dataPoints/..."]).
+    """
+    return await _batch_delete_data_points("nutrition-log", data_point_names)
+
+
+@mcp.tool(annotations=DELETE_ANNOTATIONS)
+async def delete_hydration_logs(data_point_names: list[str]) -> dict[str, Any]:
+    """
+    Delete one or more duplicate/mistyped water entries from Google Health (`hydration-log`).
+    Pass the `name` field(s) returned by `get_hydration`.
+    """
+    return await _batch_delete_data_points("hydration-log", data_point_names)
+
+
+@mcp.tool(annotations=WRITE_ANNOTATIONS)
+async def log_daily_checkin(
+    date: str | None = None,
+    soreness: float | None = None,
+    muscle_soreness: dict[str, float] | None = None,
+    cramp_warning: bool | None = None,
+    energy_level: float | None = None,
+    waist_in: float | None = None,
+    waist_cm: float | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """
+    Log or update a daily readiness check-in & body measurement in Firestore (`daily_checkins`).
+    Upserts into one document per date (YYYY-MM-DD, defaults to local today) without overwriting
+    other fields already logged for that day.
+
+    Args:
+        date: Optional YYYY-MM-DD date (defaults to today in USER_TIMEZONE).
+        soreness: Optional overall soreness score (0-10).
+        muscle_soreness: Optional per-muscle scores, e.g. {"hamstrings": 3, "quads": 2}.
+        cramp_warning: Optional boolean flag indicating cramp tightness/warning.
+        energy_level: Optional subjective energy score (0-10).
+        waist_in: Optional waist circumference in inches.
+        waist_cm: Optional waist circumference in centimeters.
+        notes: Optional short note.
+    """
+    _get_verified_token()
+    day = _parse_date(date).date().isoformat() if date else datetime.now(USER_TZ).date().isoformat()
+
+    doc: dict[str, Any] = {
+        "date": day,
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if soreness is not None:
+        doc["soreness"] = round(float(soreness), 1)
+    if muscle_soreness:
+        doc["muscle_soreness"] = {
+            str(k).strip().lower(): round(float(v), 1) for k, v in muscle_soreness.items()
+        }
+    if cramp_warning is not None:
+        doc["cramp_warning"] = bool(cramp_warning)
+    if energy_level is not None:
+        doc["energy_level"] = round(float(energy_level), 1)
+    if waist_in is not None:
+        doc["waist_in"] = round(float(waist_in), 2)
+        doc["waist_cm"] = round(float(waist_in) * 2.54, 1)
+    elif waist_cm is not None:
+        doc["waist_cm"] = round(float(waist_cm), 1)
+        doc["waist_in"] = round(float(waist_cm) / 2.54, 2)
+    if notes is not None:
+        doc["notes"] = notes.strip()
+
+    db = _get_firestore_client()
+    doc_ref = db.collection(CHECKIN_COLLECTION).document(day)
+    await doc_ref.set(doc, merge=True)
+    snap = await doc_ref.get()
+    return {
+        "status": "logged",
+        "date": day,
+        "checkin": snap.to_dict() or doc,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_daily_checkins(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """
+    Read daily readiness check-ins (soreness, cramp warnings, energy, waist circumference)
+    from Firestore (`daily_checkins`). Defaults to the last 30 days.
+    """
+    _get_verified_token()
+    start, end = _default_date_range(start_date, end_date, default_days=30)
+    clamped_limit = max(1, min(int(limit), 100))
+
+    db = _get_firestore_client()
+    query = (
+        db.collection(CHECKIN_COLLECTION)
+        .where("date", ">=", start)
+        .where("date", "<=", end)
+    )
+
+    items: list[dict[str, Any]] = []
+    async for snap in query.stream():
+        data = snap.to_dict() or {}
+        if "date" not in data:
+            data["date"] = snap.id
+        items.append(data)
+
+    items.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+    items = items[:clamped_limit]
+
+    waist_entries = [i for i in items if i.get("waist_in") is not None]
+    return {
+        "timezone": USER_TIMEZONE_NAME,
+        "start_date": start,
+        "end_date": end,
+        "checkin_count": len(items),
+        "latest_waist_in": waist_entries[0]["waist_in"] if waist_entries else None,
+        "checkins": items,
+    }
 
 
 @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
