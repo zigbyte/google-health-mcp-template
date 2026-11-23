@@ -305,13 +305,30 @@ DELETE_ANNOTATIONS = {
 STRENGTH_COLLECTION = os.environ.get("STRENGTH_COLLECTION", "strength_logs")
 MINDFULNESS_COLLECTION = os.environ.get("MINDFULNESS_COLLECTION", "mindfulness_logs")
 CHECKIN_COLLECTION = os.environ.get("CHECKIN_COLLECTION", "daily_checkins")
+PROFILE_COLLECTION = os.environ.get("PROFILE_COLLECTION", "user_profile")
 USER_TIMEZONE_NAME = os.environ.get("USER_TIMEZONE", "UTC").strip() or "UTC"
 USER_TZ = ZoneInfo(USER_TIMEZONE_NAME)
 USER_SEX = os.environ.get("USER_SEX", "").strip().lower()
 USER_HEIGHT_CM_RAW = os.environ.get("USER_HEIGHT_CM", "").strip()
 USER_BIRTH_YEAR_RAW = os.environ.get("USER_BIRTH_YEAR", "").strip()
 USER_GOAL_WEIGHT_LBS_RAW = os.environ.get("USER_GOAL_WEIGHT_LBS", "").strip()
+USER_GOAL_OBJECTIVE_DEFAULT = (
+    os.environ.get("USER_GOAL_OBJECTIVE", "").strip()
+    or "Reach optimal lean athletic weight with shredded muscle retention"
+)
 _firestore_client: Any = None
+_goals_cache: dict[str, Any] | None = None
+_goals_cache_ts: float = 0.0
+_GOALS_CACHE_TTL_SEC = 60.0
+
+VALID_WEIGHT_MODES = ("optimal", "custom")
+VALID_PACE_MODES = ("optimal", "slow", "normal", "medium_fast", "fast", "by_date")
+PACE_PRESET_PCT_BW_WK: dict[str, float] = {
+    "slow": 0.35,
+    "normal": 0.55,
+    "medium_fast": 0.75,
+    "fast": 1.00,
+}
 
 
 def _parse_optional_float(raw: str) -> float | None:
@@ -377,6 +394,201 @@ def _build_user_profile(
         profile["waist_to_height_ratio"] = round((latest_waist_in * 2.54) / height_cm, 3)
 
     return profile
+
+
+def _default_goals_from_env() -> dict[str, Any]:
+    env_weight = _parse_optional_float(USER_GOAL_WEIGHT_LBS_RAW)
+    has_custom = bool(env_weight and env_weight > 0)
+    return {
+        "goal_objective": USER_GOAL_OBJECTIVE_DEFAULT,
+        "target_weight_mode": "custom" if has_custom else "optimal",
+        "custom_target_weight_lbs": round(env_weight, 1) if has_custom and env_weight else None,
+        "pace_mode": "optimal",
+        "target_date": None,
+        "milestone_phase": 1,
+        "milestone_target_lbs": None,
+        "milestone_target_waist_in": None,
+        "milestone_approved": False,
+        "notes": "",
+        "updated_at": None,
+        "updated_by": "env_default",
+    }
+
+
+async def _load_user_goals(force_refresh: bool = False) -> tuple[dict[str, Any], str]:
+    """Load mutable user goals from Firestore (cached 60s), falling back to env defaults."""
+    global _goals_cache, _goals_cache_ts
+    now = time.time()
+    if not force_refresh and _goals_cache is not None and (now - _goals_cache_ts) < _GOALS_CACHE_TTL_SEC:
+        return dict(_goals_cache), str(_goals_cache.get("_source", "firestore"))
+
+    defaults = _default_goals_from_env()
+    try:
+        db = _get_firestore_client()
+        snap = await db.collection(PROFILE_COLLECTION).document("goals").get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            merged = {**defaults, **{k: v for k, v in data.items() if k in defaults}}
+            merged["_source"] = "firestore"
+            _goals_cache = dict(merged)
+            _goals_cache_ts = now
+            return {k: v for k, v in merged.items() if k != "_source"}, "firestore"
+    except Exception as exc:
+        logger.warning("Failed to load user_profile/goals from Firestore: %s", exc)
+
+    defaults_cached = {**defaults, "_source": "env_default"}
+    _goals_cache = dict(defaults_cached)
+    _goals_cache_ts = now
+    return defaults, "env_default"
+
+
+def _compute_goal_targets(
+    goals: dict[str, Any],
+    latest_weight_kg: float | None = None,
+    latest_waist_in: float | None = None,
+) -> dict[str, Any]:
+    """Compute objective physiological anchors, Phase milestone, and safe pace targets."""
+    height_cm = _parse_optional_float(USER_HEIGHT_CM_RAW)
+    is_male = USER_SEX == "male"
+    latest_weight_lbs = round(latest_weight_kg * 2.20462, 1) if latest_weight_kg else None
+
+    anchors: dict[str, Any] = {
+        "target_whtr": [0.45, 0.50] if is_male else [0.44, 0.49],
+        "target_bf_pct": [10, 15] if is_male else [18, 22],
+    }
+    if height_cm and height_cm > 0:
+        h_m = height_cm / 100.0
+        anchors["bmi_healthy_lbs"] = [
+            round(18.5 * h_m * h_m * 2.20462),
+            round(24.9 * h_m * h_m * 2.20462),
+        ]
+        recomp_bmi_lo, recomp_bmi_hi = (21.5, 25.5) if is_male else (20.6, 24.7)
+        anchors["athletic_recomp_lbs"] = [
+            round(recomp_bmi_lo * h_m * h_m * 2.20462),
+            round(recomp_bmi_hi * h_m * h_m * 2.20462),
+        ]
+        anchors["target_waist_in"] = [
+            round(anchors["target_whtr"][0] * height_cm / 2.54, 1),
+            round(anchors["target_whtr"][1] * height_cm / 2.54, 1),
+        ]
+        if latest_waist_in and latest_waist_in > 0:
+            anchors["current_whtr"] = round((latest_waist_in * 2.54) / height_cm, 3)
+
+    # Phase milestone (explicit or auto-proposed -10% BW checkpoint)
+    phase = int(goals.get("milestone_phase") or 1)
+    m_lbs = goals.get("milestone_target_lbs")
+    m_waist = goals.get("milestone_target_waist_in")
+    m_approved = bool(goals.get("milestone_approved", False))
+    auto_proposed = False
+    recomp_hi = (anchors.get("athletic_recomp_lbs") or [None, None])[1]
+    waist_hi = (anchors.get("target_waist_in") or [None, None])[1]
+
+    if m_lbs is None and latest_weight_lbs is not None:
+        if recomp_hi is None or latest_weight_lbs > recomp_hi + 5:
+            m_lbs = float(round(latest_weight_lbs * 0.90))
+            auto_proposed = True
+    if m_waist is None and latest_waist_in is not None and waist_hi is not None:
+        if latest_waist_in > waist_hi + 1.0:
+            m_waist = round((latest_waist_in + waist_hi) / 2.0, 1)
+            auto_proposed = True
+
+    milestone = {
+        "phase": phase,
+        "target_lbs": round(float(m_lbs), 1) if m_lbs is not None else None,
+        "target_waist_in": round(float(m_waist), 1) if m_waist is not None else None,
+        "approved": m_approved if not auto_proposed else False,
+        "auto_proposed": auto_proposed,
+    }
+
+    # Active target weight for rate / by_date math
+    weight_mode = goals.get("target_weight_mode") or "optimal"
+    active_target_lbs: float | None = None
+    if weight_mode == "custom" and goals.get("custom_target_weight_lbs"):
+        active_target_lbs = float(goals["custom_target_weight_lbs"])
+    elif milestone["target_lbs"] is not None:
+        active_target_lbs = float(milestone["target_lbs"])
+    elif recomp_hi is not None:
+        active_target_lbs = float(recomp_hi)
+
+    # Pace & deficit computation
+    pace_mode = goals.get("pace_mode") or "optimal"
+    current_whtr = anchors.get("current_whtr")
+    by_date_safety_flag: str | None = None
+    weeks_remaining: float | None = None
+
+    if pace_mode == "optimal":
+        if current_whtr is not None:
+            active_pct = 0.80 if current_whtr > 0.55 else (0.60 if current_whtr >= 0.50 else 0.45)
+        else:
+            active_pct = 0.70
+    elif pace_mode in PACE_PRESET_PCT_BW_WK:
+        active_pct = PACE_PRESET_PCT_BW_WK[pace_mode]
+    elif pace_mode == "by_date" and goals.get("target_date") and latest_weight_lbs and active_target_lbs:
+        try:
+            tgt_dt = _parse_date(str(goals["target_date"])).date()
+            today_dt = datetime.now(USER_TZ).date()
+            days_left = max(1, (tgt_dt - today_dt).days)
+            weeks_remaining = round(days_left / 7.0, 1)
+            lbs_to_lose = max(0.0, latest_weight_lbs - active_target_lbs)
+            req_lbs_wk = lbs_to_lose / max(weeks_remaining, 0.5)
+            active_pct = round((req_lbs_wk / latest_weight_lbs) * 100.0, 2)
+            if active_pct > 1.0:
+                by_date_safety_flag = "exceeds_lbm_safe_rate"
+        except Exception:
+            active_pct = 0.70
+    else:
+        active_pct = 0.70
+
+    target_lbs_per_wk = (
+        round((active_pct / 100.0) * latest_weight_lbs, 2) if latest_weight_lbs else None
+    )
+    daily_deficit_kcal = round(target_lbs_per_wk * 500) if target_lbs_per_wk is not None else None
+
+    ref_protein_lbs = recomp_hi or active_target_lbs or (latest_weight_lbs or 150.0)
+    protein_g_min = round(2.0 * (float(ref_protein_lbs) / 2.20462))
+
+    return {
+        "weight_mode": weight_mode,
+        "pace_mode": pace_mode,
+        "anchors": anchors,
+        "milestone": milestone,
+        "pace": {
+            "preset_pct_bw_wk": PACE_PRESET_PCT_BW_WK,
+            "active_pct_bw_wk": round(active_pct, 2),
+            "target_lbs_per_wk": target_lbs_per_wk,
+            "daily_deficit_kcal": daily_deficit_kcal,
+            "weeks_remaining": weeks_remaining,
+            "by_date_safety_flag": by_date_safety_flag,
+        },
+        "nutrition_floors": {
+            "protein_g_min": protein_g_min,
+            "kcal_floor": 1600 if is_male else 1350,
+        },
+    }
+
+
+def _compact_goals_summary(
+    goals: dict[str, Any], computed: dict[str, Any]
+) -> dict[str, Any]:
+    """Compact ~55-token goal summary auto-attached to cut & body-comp tools."""
+    anchors = computed.get("anchors") or {}
+    milestone = computed.get("milestone") or {}
+    pace = computed.get("pace") or {}
+    floors = computed.get("nutrition_floors") or {}
+    return {
+        "objective": goals.get("goal_objective"),
+        "weight_mode": goals.get("target_weight_mode"),
+        "custom_target_lbs": goals.get("custom_target_weight_lbs"),
+        "target_lbs_range": anchors.get("athletic_recomp_lbs"),
+        "target_waist_in": anchors.get("target_waist_in"),
+        "milestone": milestone,
+        "pace_mode": goals.get("pace_mode"),
+        "target_lbs_per_wk": pace.get("target_lbs_per_wk"),
+        "daily_deficit_kcal": pace.get("daily_deficit_kcal"),
+        "protein_g_min": floors.get("protein_g_min"),
+        "target_date": goals.get("target_date"),
+        "safety_flag": pace.get("by_date_safety_flag"),
+    }
 
 
 def _get_firestore_client() -> Any:
@@ -1217,8 +1429,11 @@ async def get_body_composition(
         else None
     )
     latest_weight_kg = weights[-1]["weight_kg"] if weights else None
+    goals, _ = await _load_user_goals()
+    computed_targets = _compute_goal_targets(goals, latest_weight_kg=latest_weight_kg)
     return {
         "user_profile": _build_user_profile(latest_weight_kg=latest_weight_kg),
+        "goals": _compact_goals_summary(goals, computed_targets),
         "start_date": start,
         "end_date": end,
         "latest_weight_lbs": weights[-1]["weight_lbs"] if weights else None,
@@ -1235,10 +1450,152 @@ async def get_body_composition(
 async def get_user_profile() -> dict[str, Any]:
     """
     Get the user's base physiological profile (sex, height, birth year, age,
-    estimated max HR, goal weight, and timezone) configured on the bridge.
+    estimated max HR, timezone), active mutable goals (North Star + Phase Milestone),
+    and computed physiological targets (athletic recomp band, WHtR target, pace, protein floor).
     """
     _get_verified_token()
-    return _build_user_profile()
+    goals, source = await _load_user_goals()
+    computed = _compute_goal_targets(goals)
+    return {
+        "physiology": _build_user_profile(),
+        "goals": goals,
+        "goals_source": source,
+        "computed_targets": computed,
+    }
+
+
+@mcp.tool(annotations=WRITE_ANNOTATIONS)
+async def update_user_goals(
+    goal_objective: str | None = None,
+    target_weight_mode: str | None = None,
+    custom_target_weight_lbs: float | None = None,
+    pace_mode: str | None = None,
+    target_date: str | None = None,
+    clear_target_date: bool = False,
+    milestone_phase: int | None = None,
+    milestone_target_lbs: float | None = None,
+    milestone_target_waist_in: float | None = None,
+    milestone_approved: bool | None = None,
+    notes: str | None = None,
+    clear_notes: bool = False,
+) -> dict[str, Any]:
+    """
+    Update the user's editable fitness goals in Firestore (shared with the local dashboard).
+    IMPORTANT: ONLY call this tool when the user EXPLICITLY asks to change, set, or approve
+    their goal, target weight, pace, target date, or Phase milestone. NEVER auto-rewrite goals
+    silently during routine check-ins or coaching advice.
+    """
+    global _goals_cache, _goals_cache_ts
+    _get_verified_token()
+
+    before, _ = await _load_user_goals(force_refresh=True)
+    after = dict(before)
+
+    if goal_objective is not None:
+        cleaned = goal_objective.strip()
+        if not cleaned or len(cleaned) > 300:
+            raise ValueError("goal_objective must be 1..300 characters.")
+        after["goal_objective"] = cleaned
+
+    if target_weight_mode is not None:
+        wm = target_weight_mode.strip().lower()
+        if wm not in VALID_WEIGHT_MODES:
+            raise ValueError(f"target_weight_mode must be one of {VALID_WEIGHT_MODES}.")
+        after["target_weight_mode"] = wm
+        if wm == "optimal" and custom_target_weight_lbs is None:
+            after["custom_target_weight_lbs"] = None
+
+    if custom_target_weight_lbs is not None:
+        val = float(custom_target_weight_lbs)
+        if not (70.0 <= val <= 500.0):
+            raise ValueError("custom_target_weight_lbs must be between 70 and 500.")
+        after["custom_target_weight_lbs"] = round(val, 1)
+        if target_weight_mode is None:
+            after["target_weight_mode"] = "custom"
+
+    if after["target_weight_mode"] == "custom" and not after.get("custom_target_weight_lbs"):
+        raise ValueError("custom_target_weight_lbs is required when target_weight_mode is 'custom'.")
+
+    if pace_mode is not None:
+        pm = pace_mode.strip().lower()
+        if pm not in VALID_PACE_MODES:
+            raise ValueError(f"pace_mode must be one of {VALID_PACE_MODES}.")
+        after["pace_mode"] = pm
+
+    if clear_target_date:
+        after["target_date"] = None
+    elif target_date is not None:
+        td = target_date.strip()
+        parsed_dt = _parse_date(td).date()
+        if parsed_dt <= datetime.now(USER_TZ).date():
+            raise ValueError("target_date must be a future date (YYYY-MM-DD).")
+        after["target_date"] = parsed_dt.isoformat()
+
+    if after["pace_mode"] == "by_date" and not after.get("target_date"):
+        raise ValueError("target_date (future YYYY-MM-DD) is required when pace_mode is 'by_date'.")
+
+    if milestone_phase is not None:
+        mp = int(milestone_phase)
+        if not (1 <= mp <= 10):
+            raise ValueError("milestone_phase must be between 1 and 10.")
+        after["milestone_phase"] = mp
+
+    if milestone_target_lbs is not None:
+        ml = float(milestone_target_lbs)
+        if not (70.0 <= ml <= 500.0):
+            raise ValueError("milestone_target_lbs must be between 70 and 500.")
+        after["milestone_target_lbs"] = round(ml, 1)
+
+    if milestone_target_waist_in is not None:
+        mw = float(milestone_target_waist_in)
+        if not (20.0 <= mw <= 70.0):
+            raise ValueError("milestone_target_waist_in must be between 20 and 70.")
+        after["milestone_target_waist_in"] = round(mw, 1)
+
+    if milestone_approved is not None:
+        after["milestone_approved"] = bool(milestone_approved)
+
+    if clear_notes:
+        after["notes"] = ""
+    elif notes is not None:
+        cleaned_notes = notes.strip()
+        if len(cleaned_notes) > 500:
+            raise ValueError("notes must be at most 500 characters.")
+        after["notes"] = cleaned_notes
+
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    after["updated_at"] = now_iso
+    after["updated_by"] = "gemini_mcp"
+
+    changed_fields = [
+        k for k in after
+        if k not in ("updated_at", "updated_by") and before.get(k) != after.get(k)
+    ]
+
+    db = _get_firestore_client()
+    doc_ref = db.collection(PROFILE_COLLECTION).document("goals")
+    await doc_ref.set(after, merge=True)
+    if changed_fields:
+        await doc_ref.collection("history").add(
+            {
+                "changed_fields": changed_fields,
+                "before": before,
+                "after": after,
+                "updated_at": now_iso,
+                "updated_by": "gemini_mcp",
+            }
+        )
+
+    _goals_cache = {**after, "_source": "firestore"}
+    _goals_cache_ts = time.time()
+
+    return {
+        "ok": True,
+        "changed_fields": changed_fields,
+        "before": before,
+        "after": after,
+        "computed_targets": _compute_goal_targets(after),
+    }
 
 
 @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
@@ -1347,12 +1704,19 @@ async def get_daily_cut_summary(
         if "tdee_kcal" in d and "intake_kcal" in d:
             d["net_deficit_kcal"] = round(d["tdee_kcal"] - d["intake_kcal"], 1)
 
+    goals, _ = await _load_user_goals()
+    computed_targets = _compute_goal_targets(
+        goals,
+        latest_weight_kg=body_res.get("latest_weight_kg"),
+        latest_waist_in=latest_waist_in,
+    )
     return {
         "timezone": USER_TIMEZONE_NAME,
         "user_profile": _build_user_profile(
             latest_weight_kg=body_res.get("latest_weight_kg"),
             latest_waist_in=latest_waist_in,
         ),
+        "goals": _compact_goals_summary(goals, computed_targets),
         "start_date": start,
         "end_date": end,
         "latest_weight_lbs": body_res.get("latest_weight_lbs"),
