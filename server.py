@@ -323,6 +323,8 @@ _GOALS_CACHE_TTL_SEC = 60.0
 
 VALID_WEIGHT_MODES = ("optimal", "custom")
 VALID_PACE_MODES = ("optimal", "slow", "normal", "medium_fast", "fast", "by_date")
+VALID_NUTRITION_PHASES = ("cut", "refeed", "diet_break")
+VALID_PAIN_TYPES = ("doms", "joint_tendon")
 PACE_PRESET_PCT_BW_WK: dict[str, float] = {
     "slow": 0.35,
     "normal": 0.55,
@@ -404,6 +406,7 @@ def _default_goals_from_env() -> dict[str, Any]:
         "target_weight_mode": "custom" if has_custom else "optimal",
         "custom_target_weight_lbs": round(env_weight, 1) if has_custom and env_weight else None,
         "pace_mode": "optimal",
+        "nutrition_phase": "cut",
         "target_date": None,
         "milestone_phase": 1,
         "milestone_target_lbs": None,
@@ -583,11 +586,110 @@ def _compact_goals_summary(
         "target_waist_in": anchors.get("target_waist_in"),
         "milestone": milestone,
         "pace_mode": goals.get("pace_mode"),
+        "nutrition_phase": goals.get("nutrition_phase", "cut"),
         "target_lbs_per_wk": pace.get("target_lbs_per_wk"),
         "daily_deficit_kcal": pace.get("daily_deficit_kcal"),
         "protein_g_min": floors.get("protein_g_min"),
         "target_date": goals.get("target_date"),
         "safety_flag": pace.get("by_date_safety_flag"),
+    }
+
+
+def _compute_ewma_weight(weights: list[dict[str, Any]], alpha: float = 0.1) -> dict[str, Any]:
+    """Compute EWMA weight trend and weekly slope from daily-deduped weight points."""
+    by_day: dict[str, float] = {}
+    for w in weights:
+        d = str(w.get("date") or "")
+        val = w.get("weight_lbs")
+        if d and d != "unknown" and val is not None:
+            by_day[d] = float(val)
+    if not by_day:
+        return {"ewma_lbs": None, "slope_lbs_per_wk": None, "days_with_weight": 0}
+
+    ordered = sorted(by_day.items())
+    ewma_series: list[tuple[datetime, float]] = []
+    ewma = ordered[0][1]
+    for day_str, val in ordered:
+        ewma = alpha * val + (1.0 - alpha) * ewma
+        try:
+            ewma_series.append((_parse_date(day_str), ewma))
+        except Exception:
+            continue
+
+    slope_lbs_wk: float | None = None
+    if len(ewma_series) >= 2:
+        span_days = (ewma_series[-1][0] - ewma_series[0][0]).days
+        if span_days >= 3:
+            delta = ewma_series[-1][1] - ewma_series[0][1]
+            slope_lbs_wk = round((delta / span_days) * 7.0, 2)
+
+    return {
+        "ewma_lbs": round(ewma_series[-1][1], 2) if ewma_series else None,
+        "slope_lbs_per_wk": slope_lbs_wk,
+        "days_with_weight": len(ordered),
+    }
+
+
+def _compute_rhr_recovery_delta(daily_vitals: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Compute robust RHR delta: 3-day mean vs 28-day median/MAD."""
+    rhr_pairs: list[tuple[str, float]] = []
+    for day in sorted(daily_vitals.keys()):
+        val = daily_vitals[day].get("resting_hr_bpm")
+        if val is not None:
+            rhr_pairs.append((day, float(val)))
+    if len(rhr_pairs) < 4:
+        return {"rhr_3d_avg": None, "rhr_28d_median": None, "rhr_sigma": None, "rhr_elevated_flag": False}
+
+    vals = [v for _, v in rhr_pairs]
+    svals = sorted(vals)
+    n = len(svals)
+    med = svals[n // 2] if n % 2 == 1 else (svals[n // 2 - 1] + svals[n // 2]) / 2.0
+    abs_devs = sorted(abs(v - med) for v in vals)
+    mad = abs_devs[n // 2] if n % 2 == 1 else (abs_devs[n // 2 - 1] + abs_devs[n // 2]) / 2.0
+    robust_sd = max(mad * 1.4826, 1.0)
+
+    recent_3 = [v for _, v in rhr_pairs[-3:]]
+    rhr_3d_avg = round(sum(recent_3) / len(recent_3), 1)
+    sigma = round((rhr_3d_avg - med) / robust_sd, 2)
+    consec_high = sum(1 for v in recent_3[-2:] if (v - med) / robust_sd >= 1.5)
+    return {
+        "rhr_3d_avg": rhr_3d_avg,
+        "rhr_28d_median": round(med, 1),
+        "rhr_sigma": sigma,
+        "rhr_elevated_flag": consec_high >= 2,
+    }
+
+
+def _derive_cycle_context(checkins: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Derive menstrual cycle day & estimated phase from the latest cycle_day_1=True check-in."""
+    today_dt = datetime.now(USER_TZ).date()
+    day1_dates: list[str] = [
+        str(c.get("date"))
+        for c in checkins
+        if c.get("cycle_day_1") is True and c.get("date")
+    ]
+    if not day1_dates:
+        return None
+    latest_day1 = max(day1_dates)
+    try:
+        d1 = _parse_date(latest_day1).date()
+    except Exception:
+        return None
+    cycle_day = (today_dt - d1).days + 1
+    if cycle_day < 1 or cycle_day > 45:
+        return None
+    if cycle_day <= 5:
+        phase = "menstrual"
+    elif cycle_day <= 12:
+        phase = "follicular"
+    elif cycle_day <= 15:
+        phase = "ovulatory"
+    else:
+        phase = "luteal"
+    return {
+        "cycle_day": cycle_day,
+        "last_cycle_day_1": latest_day1,
+        "estimated_phase": phase,
     }
 
 
@@ -1400,7 +1502,7 @@ async def get_body_composition(
             ts = w.get("sampleTime", {}).get("physicalTime") or ""
             weights.append(
                 {
-                    "date": ts[:10] if len(ts) >= 10 else "unknown",
+                    "date": _iso_to_local_date(ts) if ts else "unknown",
                     "timestamp": ts,
                     "weight_lbs": round(kg * 2.20462262, 2),
                     "weight_kg": round(kg, 2),
@@ -1416,7 +1518,7 @@ async def get_body_composition(
         if pct is not None:
             body_fat.append(
                 {
-                    "date": ts[:10] if len(ts) >= 10 else "unknown",
+                    "date": _iso_to_local_date(ts) if ts else "unknown",
                     "timestamp": ts,
                     "body_fat_pct": round(float(pct), 2),
                 }
@@ -1428,6 +1530,7 @@ async def get_body_composition(
         if len(weights) >= 2
         else None
     )
+    ewma = _compute_ewma_weight(weights)
     latest_weight_kg = weights[-1]["weight_kg"] if weights else None
     goals, _ = await _load_user_goals()
     computed_targets = _compute_goal_targets(goals, latest_weight_kg=latest_weight_kg)
@@ -1438,6 +1541,8 @@ async def get_body_composition(
         "end_date": end,
         "latest_weight_lbs": weights[-1]["weight_lbs"] if weights else None,
         "latest_weight_kg": latest_weight_kg,
+        "ewma_weight_lbs": ewma["ewma_lbs"],
+        "weight_slope_lbs_per_wk": ewma["slope_lbs_per_wk"],
         "weight_change_lbs": change_lbs,
         "weight_count": len(weights),
         "weights": weights,
@@ -1470,6 +1575,7 @@ async def update_user_goals(
     target_weight_mode: str | None = None,
     custom_target_weight_lbs: float | None = None,
     pace_mode: str | None = None,
+    nutrition_phase: str | None = None,
     target_date: str | None = None,
     clear_target_date: bool = False,
     milestone_phase: int | None = None,
@@ -1521,6 +1627,12 @@ async def update_user_goals(
         if pm not in VALID_PACE_MODES:
             raise ValueError(f"pace_mode must be one of {VALID_PACE_MODES}.")
         after["pace_mode"] = pm
+
+    if nutrition_phase is not None:
+        np_val = nutrition_phase.strip().lower()
+        if np_val not in VALID_NUTRITION_PHASES:
+            raise ValueError(f"nutrition_phase must be one of {VALID_NUTRITION_PHASES}.")
+        after["nutrition_phase"] = np_val
 
     if clear_target_date:
         after["target_date"] = None
@@ -1617,20 +1729,31 @@ async def get_daily_cut_summary(
     recovery_fn = getattr(get_recovery_vitals, "fn", get_recovery_vitals)
     checkins_fn = getattr(get_daily_checkins, "fn", get_daily_checkins)
 
+    sleep_fn = getattr(get_sleep, "fn", get_sleep)
+    start_28d, _ = _default_date_range(None, None, default_days=28)
+    start_45d, _ = _default_date_range(None, None, default_days=45)
+
     async def _safe_checkins() -> dict[str, Any]:
         try:
-            return await checkins_fn(start_date=start, end_date=end)
+            return await checkins_fn(start_date=start_45d, end_date=end, limit=50)
         except Exception:
             return {"checkins": []}
 
-    energy_res, meals_res, hydration_res, body_res, recovery_res, checkins_res = (
+    async def _safe_sleep() -> dict[str, Any]:
+        try:
+            return await sleep_fn(start_date=start, end_date=end)
+        except Exception:
+            return {"sleep_sessions": []}
+
+    energy_res, meals_res, hydration_res, body_res, recovery_res, checkins_res, sleep_res = (
         await asyncio.gather(
             energy_fn(start_date=start, end_date=end),
             meals_fn(start_date=start, end_date=end),
             hydration_fn(start_date=start, end_date=end),
-            body_fn(start_date=start, end_date=end),
-            recovery_fn(start_date=start, end_date=end),
+            body_fn(start_date=start_28d, end_date=end),
+            recovery_fn(start_date=start_28d, end_date=end),
             _safe_checkins(),
+            _safe_sleep(),
         )
     )
 
@@ -1681,28 +1804,52 @@ async def get_daily_cut_summary(
         by_day[day]["water_fl_oz"] = h["fl_oz"]
 
     for w in body_res.get("weights", []):
-        by_day[w["date"]]["weight_lbs"] = w["weight_lbs"]
+        if w["date"] >= start:
+            by_day[w["date"]]["weight_lbs"] = w["weight_lbs"]
 
     for day, v in recovery_res.get("daily_vitals", {}).items():
-        by_day[day].update(v)
+        if day >= start:
+            by_day[day].update(v)
 
     latest_waist_in: float | None = None
-    for c in checkins_res.get("checkins", []):
+    all_checkins = checkins_res.get("checkins", [])
+    for c in all_checkins:
         c_day = str(c.get("date") or "")
-        if c_day:
+        if c_day and c_day >= start:
             checkin_summary = {
                 k: v
                 for k, v in c.items()
-                if k in ("soreness", "muscle_soreness", "cramp_warning", "energy_level", "waist_in", "waist_cm", "notes")
+                if k
+                in (
+                    "soreness",
+                    "muscle_soreness",
+                    "pain_types",
+                    "cramp_warning",
+                    "cycle_day_1",
+                    "energy_level",
+                    "waist_in",
+                    "waist_cm",
+                    "notes",
+                )
             }
             if checkin_summary:
                 by_day[c_day]["checkin"] = checkin_summary
         if latest_waist_in is None and c.get("waist_in") is not None:
             latest_waist_in = float(c["waist_in"])
 
+    today_local = datetime.now(USER_TZ).date().isoformat()
+    complete_days: list[dict[str, Any]] = []
     for day, d in by_day.items():
+        intake = float(d.get("intake_kcal") or 0)
+        mcount = int(d.get("meal_count") or 0)
+        is_complete = (day < today_local) and (intake >= 800.0 or mcount >= 2)
+        d["is_complete_day"] = is_complete
         if "tdee_kcal" in d and "intake_kcal" in d:
-            d["net_deficit_kcal"] = round(d["tdee_kcal"] - d["intake_kcal"], 1)
+            if is_complete:
+                d["net_deficit_kcal"] = round(d["tdee_kcal"] - d["intake_kcal"], 1)
+                complete_days.append(d)
+            else:
+                d["partial_day"] = True
 
     goals, _ = await _load_user_goals()
     computed_targets = _compute_goal_targets(
@@ -1710,6 +1857,74 @@ async def get_daily_cut_summary(
         latest_weight_kg=body_res.get("latest_weight_kg"),
         latest_waist_in=latest_waist_in,
     )
+
+    # Derived Tier A/B signals (~120 tokens, zero new logging)
+    ewma_w = _compute_ewma_weight(body_res.get("weights", []))
+    rhr_delta = _compute_rhr_recovery_delta(recovery_res.get("daily_vitals", {}))
+    cycle_ctx = _derive_cycle_context(all_checkins)
+
+    # 7D sleep debt vs 7.5h target
+    sleep_by_day: dict[str, float] = defaultdict(float)
+    for sp in sleep_res.get("sleep_sessions", []):
+        sl = sp.get("sleep") or sp
+        dur_ms = 0.0
+        for st in (sl.get("stages") or []):
+            if str(st.get("type", "")).upper() != "AWAKE":
+                s_ts = st.get("interval", {}).get("startTime")
+                e_ts = st.get("interval", {}).get("endTime")
+                if s_ts and e_ts:
+                    try:
+                        dur_ms += (
+                            datetime.fromisoformat(e_ts.replace("Z", "+00:00"))
+                            - datetime.fromisoformat(s_ts.replace("Z", "+00:00"))
+                        ).total_seconds()
+                    except Exception:
+                        pass
+        if dur_ms > 0:
+            end_ts = sl.get("interval", {}).get("endTime") or ""
+            s_day = _iso_to_local_date(end_ts) if end_ts else "unknown"
+            sleep_by_day[s_day] += dur_ms / 3600.0
+    sleep_debt_hrs = (
+        round(sum(max(0.0, 7.5 - h) for h in sleep_by_day.values()), 1)
+        if sleep_by_day
+        else None
+    )
+
+    avg_protein_complete = (
+        round(sum(float(d.get("protein_g") or 0) for d in complete_days) / len(complete_days), 1)
+        if complete_days
+        else None
+    )
+    avg_intake_complete = (
+        round(sum(float(d.get("intake_kcal") or 0) for d in complete_days) / len(complete_days), 1)
+        if complete_days
+        else None
+    )
+    implied_tdee_kcal: int | None = None
+    if (
+        avg_intake_complete is not None
+        and ewma_w["slope_lbs_per_wk"] is not None
+        and len(complete_days) >= max(4, int(clamped_days * 0.7))
+        and ewma_w["days_with_weight"] >= 5
+    ):
+        implied_tdee_kcal = round(avg_intake_complete - (ewma_w["slope_lbs_per_wk"] * 500.0))
+
+    derived_signals = {
+        "ewma_weight_lbs": ewma_w["ewma_lbs"],
+        "weight_slope_lbs_per_wk": ewma_w["slope_lbs_per_wk"],
+        "complete_meal_days": len(complete_days),
+        "complete_days_avg_intake_kcal": avg_intake_complete,
+        "complete_days_avg_protein_g": avg_protein_complete,
+        "protein_floor_g": computed_targets["nutrition_floors"]["protein_g_min"],
+        "implied_tdee_kcal": implied_tdee_kcal,
+        "rhr_3d_avg": rhr_delta["rhr_3d_avg"],
+        "rhr_28d_median": rhr_delta["rhr_28d_median"],
+        "rhr_sigma": rhr_delta["rhr_sigma"],
+        "rhr_elevated_flag": rhr_delta["rhr_elevated_flag"],
+        "sleep_debt_hours_window": sleep_debt_hrs,
+        "cycle_context": cycle_ctx,
+    }
+
     return {
         "timezone": USER_TIMEZONE_NAME,
         "user_profile": _build_user_profile(
@@ -1717,6 +1932,7 @@ async def get_daily_cut_summary(
             latest_waist_in=latest_waist_in,
         ),
         "goals": _compact_goals_summary(goals, computed_targets),
+        "derived_signals": derived_signals,
         "start_date": start,
         "end_date": end,
         "latest_weight_lbs": body_res.get("latest_weight_lbs"),
@@ -1802,7 +2018,7 @@ async def log_strength_sets(
     top_weight = max((s["weight_lbs"] for s in normalized_sets), default=0.0)
 
     doc: dict[str, Any] = {
-        "date": dt.date().isoformat(),
+        "date": dt.astimezone(USER_TZ).date().isoformat(),
         "logged_at": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "exercise": exercise_clean,
         "exercise_key": exercise_clean.lower(),
@@ -1862,7 +2078,13 @@ async def get_strength_logs(
         name = str(e.get("exercise", "Unknown"))
         agg = by_exercise.setdefault(
             name,
-            {"sessions": 0, "total_sets": 0, "total_volume_lbs": 0.0, "top_weight_lbs": 0.0},
+            {
+                "sessions": 0,
+                "total_sets": 0,
+                "total_volume_lbs": 0.0,
+                "top_weight_lbs": 0.0,
+                "top_e1rm_lbs": 0.0,
+            },
         )
         agg["sessions"] += 1
         agg["total_sets"] += int(e.get("total_sets") or 0)
@@ -1870,6 +2092,12 @@ async def get_strength_logs(
             agg["total_volume_lbs"] + float(e.get("total_volume_lbs") or 0), 1
         )
         agg["top_weight_lbs"] = max(agg["top_weight_lbs"], float(e.get("top_weight_lbs") or 0))
+        for s in e.get("sets") or []:
+            w_val = float(s.get("weight_lbs") or 0)
+            r_val = int(s.get("reps") or 0)
+            if w_val > 0 and r_val > 0:
+                e1rm = round(w_val * (1.0 + r_val / 30.0), 1)
+                agg["top_e1rm_lbs"] = max(agg["top_e1rm_lbs"], e1rm)
 
     return {
         "start_date": start,
@@ -1939,7 +2167,7 @@ async def log_mindfulness_session(
         dt = datetime.now(timezone.utc)
 
     doc: dict[str, Any] = {
-        "date": dt.date().isoformat(),
+        "date": dt.astimezone(USER_TZ).date().isoformat(),
         "logged_at": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "duration_minutes": round(float(duration_minutes), 1),
         "session_type": session_type.strip().upper() or "MEDITATION",
@@ -2088,7 +2316,9 @@ async def log_daily_checkin(
     date: str | None = None,
     soreness: float | None = None,
     muscle_soreness: dict[str, float] | None = None,
+    pain_types: dict[str, str] | None = None,
     cramp_warning: bool | None = None,
+    cycle_day_1: bool | None = None,
     energy_level: float | None = None,
     waist_in: float | None = None,
     waist_cm: float | None = None,
@@ -2102,8 +2332,10 @@ async def log_daily_checkin(
     Args:
         date: Optional YYYY-MM-DD date (defaults to today in USER_TIMEZONE).
         soreness: Optional overall soreness score (0-10).
-        muscle_soreness: Optional per-muscle scores, e.g. {"hamstrings": 3, "quads": 2}.
+        muscle_soreness: Optional per-muscle scores, e.g. {"hamstrings": 3, "right_knee": 4}.
+        pain_types: Optional map distinguishing DOMS vs joint/tendon irritation, e.g. {"right_knee": "joint_tendon", "hamstrings": "doms"}.
         cramp_warning: Optional boolean flag indicating cramp tightness/warning.
+        cycle_day_1: Optional boolean (True on day 1 of menstrual cycle, ~1x/month) to anchor luteal/follicular context.
         energy_level: Optional subjective energy score (0-10).
         waist_in: Optional waist circumference in inches.
         waist_cm: Optional waist circumference in centimeters.
@@ -2122,8 +2354,18 @@ async def log_daily_checkin(
         doc["muscle_soreness"] = {
             str(k).strip().lower(): round(float(v), 1) for k, v in muscle_soreness.items()
         }
+    if pain_types:
+        cleaned_pt: dict[str, str] = {}
+        for k, v in pain_types.items():
+            pt_val = str(v).strip().lower()
+            if pt_val not in VALID_PAIN_TYPES:
+                raise ValueError(f"pain_types values must be one of {VALID_PAIN_TYPES}.")
+            cleaned_pt[str(k).strip().lower()] = pt_val
+        doc["pain_types"] = cleaned_pt
     if cramp_warning is not None:
         doc["cramp_warning"] = bool(cramp_warning)
+    if cycle_day_1 is not None:
+        doc["cycle_day_1"] = bool(cycle_day_1)
     if energy_level is not None:
         doc["energy_level"] = round(float(energy_level), 1)
     if waist_in is not None:
@@ -2183,6 +2425,7 @@ async def get_daily_checkins(
         "start_date": start,
         "end_date": end,
         "checkin_count": len(items),
+        "cycle_context": _derive_cycle_context(items),
         "latest_waist_in": waist_entries[0]["waist_in"] if waist_entries else None,
         "checkins": items,
     }
