@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import logging
+import math
 import os
 import time
 import weakref
@@ -33,6 +35,8 @@ from mcp.server.auth.provider import AccessToken, RefreshToken, TokenError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import BaseModel
 from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
@@ -306,6 +310,18 @@ STRENGTH_COLLECTION = os.environ.get("STRENGTH_COLLECTION", "strength_logs")
 MINDFULNESS_COLLECTION = os.environ.get("MINDFULNESS_COLLECTION", "mindfulness_logs")
 CHECKIN_COLLECTION = os.environ.get("CHECKIN_COLLECTION", "daily_checkins")
 PROFILE_COLLECTION = os.environ.get("PROFILE_COLLECTION", "user_profile")
+GLUCOSE_COLLECTION = os.environ.get("GLUCOSE_COLLECTION", "glucose_days")
+SUPPLEMENTS_COLLECTION = os.environ.get("SUPPLEMENTS_COLLECTION", "supplement_med_logs")
+LLU_VERSION = os.environ.get("LLU_VERSION", "4.16.0").strip() or "4.16.0"
+VALID_SUPP_CATEGORIES = ("vitamin", "supplement", "medication")
+VALID_SUPP_TIMINGS = ("morning", "pre_workout", "with_meal", "evening", "as_needed")
+LLU_TREND_MAP = {
+    1: ("↓", "falling_quickly"),
+    2: ("↘", "falling"),
+    3: ("→", "stable"),
+    4: ("↗", "rising"),
+    5: ("↑", "rising_quickly"),
+}
 USER_TIMEZONE_NAME = os.environ.get("USER_TIMEZONE", "UTC").strip() or "UTC"
 USER_TZ = ZoneInfo(USER_TIMEZONE_NAME)
 USER_SEX = os.environ.get("USER_SEX", "").strip().lower()
@@ -1745,7 +1761,21 @@ async def get_daily_cut_summary(
         except Exception:
             return {"sleep_sessions": []}
 
-    energy_res, meals_res, hydration_res, body_res, recovery_res, checkins_res, sleep_res = (
+    async def _safe_glucose() -> dict[str, Any]:
+        try:
+            glucose_fn = getattr(get_glucose, "fn", get_glucose)
+            return await glucose_fn(start_date=start, end_date=end, include_meal_spikes=False)
+        except Exception:
+            return {}
+
+    async def _safe_supplements() -> dict[str, Any]:
+        try:
+            supp_fn = getattr(get_supplement_med_logs, "fn", get_supplement_med_logs)
+            return await supp_fn(start_date=start, end_date=end, limit=100)
+        except Exception:
+            return {"logs": []}
+
+    energy_res, meals_res, hydration_res, body_res, recovery_res, checkins_res, sleep_res, glucose_res, supp_res = (
         await asyncio.gather(
             energy_fn(start_date=start, end_date=end),
             meals_fn(start_date=start, end_date=end),
@@ -1754,6 +1784,8 @@ async def get_daily_cut_summary(
             recovery_fn(start_date=start_28d, end_date=end),
             _safe_checkins(),
             _safe_sleep(),
+            _safe_glucose(),
+            _safe_supplements(),
         )
     )
 
@@ -1909,6 +1941,28 @@ async def get_daily_cut_summary(
     ):
         implied_tdee_kcal = round(avg_intake_complete - (ewma_w["slope_lbs_per_wk"] * 500.0))
 
+    for s_entry in supp_res.get("logs", []):
+        s_day = str(s_entry.get("date") or "")
+        if s_day and s_day >= start:
+            label = str(s_entry.get("name") or "")
+            if s_entry.get("dose") is not None:
+                label = f"{label} ({s_entry['dose']}{s_entry.get('unit') or ''})".strip()
+            by_day[s_day].setdefault("supplements_meds", []).append(label)
+
+    glucose_compact: dict[str, Any] | None = None
+    if glucose_res and glucose_res.get("summary"):
+        g_lat = glucose_res.get("latest") or {}
+        g_sum = glucose_res.get("summary") or {}
+        glucose_compact = {
+            "latest_mmol_l": g_lat.get("mmol_l"),
+            "latest_mg_dl": g_lat.get("mg_dl"),
+            "trend": g_lat.get("trend_arrow"),
+            "mean_mmol_l": g_sum.get("mean_mmol_l"),
+            "tir_70_140_pct": g_sum.get("tir_70_140_pct"),
+            "cv_pct": g_sum.get("cv_pct"),
+            "fasting_mmol_l": g_sum.get("fasting_avg_mmol_l"),
+        }
+
     derived_signals = {
         "ewma_weight_lbs": ewma_w["ewma_lbs"],
         "weight_slope_lbs_per_wk": ewma_w["slope_lbs_per_wk"],
@@ -1923,6 +1977,7 @@ async def get_daily_cut_summary(
         "rhr_elevated_flag": rhr_delta["rhr_elevated_flag"],
         "sleep_debt_hours_window": sleep_debt_hrs,
         "cycle_context": cycle_ctx,
+        "glucose": glucose_compact,
     }
 
     return {
@@ -2455,6 +2510,564 @@ async def query_health_data_type(
         "count": len(points),
         "data_points": points,
     }
+
+
+# ============================================================================
+# FREESTYLE LIBRE 3+ CGM (LIBRELINKUP -> FIRESTORE DAILY BUCKETS)
+# ============================================================================
+
+
+def _mg_to_mmol(mg_dl: float) -> float:
+    return round(float(mg_dl) / 18.0182, 2)
+
+
+def _parse_llu_timestamp(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _compute_glucose_day_stats(points_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if not points_map:
+        return {}
+    ordered_keys = sorted(points_map.keys())
+    vals = [float(points_map[k]["mg_dl"]) for k in ordered_keys if points_map[k].get("mg_dl") is not None]
+    if not vals:
+        return {}
+    n = len(vals)
+    mean_mg = sum(vals) / n
+    var_mg = sum((v - mean_mg) ** 2 for v in vals) / n
+    sd_mg = math.sqrt(var_mg)
+    cv_pct = round((sd_mg / mean_mg) * 100.0, 1) if mean_mg > 0 else 0.0
+    tir_opt = round(sum(1 for v in vals if 70.0 <= v <= 140.0) / n * 100.0, 1)
+    tir_clin = round(sum(1 for v in vals if 70.0 <= v <= 180.0) / n * 100.0, 1)
+
+    # Fasting / overnight (00:00..06:59 local time)
+    fasting_vals: list[float] = []
+    for k in ordered_keys:
+        try:
+            dt_local = datetime.fromisoformat(k.replace("Z", "+00:00")).astimezone(USER_TZ)
+            if 0 <= dt_local.hour < 7:
+                fasting_vals.append(float(points_map[k]["mg_dl"]))
+        except Exception:
+            continue
+    fasting_mg = round(sum(fasting_vals) / len(fasting_vals), 1) if fasting_vals else None
+
+    last_k = ordered_keys[-1]
+    last_pt = points_map[last_k]
+    return {
+        "sample_count": n,
+        "mean_mg_dl": round(mean_mg, 1),
+        "mean_mmol_l": _mg_to_mmol(mean_mg),
+        "min_mg_dl": round(min(vals), 1),
+        "max_mg_dl": round(max(vals), 1),
+        "sd_mg_dl": round(sd_mg, 1),
+        "cv_pct": cv_pct,
+        "tir_70_140_pct": tir_opt,
+        "tir_70_180_pct": tir_clin,
+        "fasting_mg_dl": fasting_mg,
+        "fasting_mmol_l": _mg_to_mmol(fasting_mg) if fasting_mg is not None else None,
+        "latest_mg_dl": float(last_pt["mg_dl"]),
+        "latest_mmol_l": _mg_to_mmol(float(last_pt["mg_dl"])),
+        "latest_trend": last_pt.get("trend"),
+        "latest_timestamp": last_k,
+    }
+
+
+async def _llu_login(client: httpx.AsyncClient, email: str, password: str) -> dict[str, Any]:
+    headers = {
+        "product": "llu.android",
+        "version": LLU_VERSION,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    base = "https://api.libreview.io"
+    resp = await client.post(
+        f"{base}/llu/auth/login", headers=headers, json={"email": email, "password": password}
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    data = payload.get("data") or {}
+    if data.get("redirect") and data.get("region"):
+        region = str(data["region"]).strip().lower()
+        base = f"https://api-{region}.libreview.io"
+        resp = await client.post(
+            f"{base}/llu/auth/login", headers=headers, json={"email": email, "password": password}
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        data = payload.get("data") or {}
+
+    ticket = data.get("authTicket") or {}
+    user = data.get("user") or {}
+    token = ticket.get("token")
+    user_id = user.get("id")
+    if not token or not user_id:
+        raise RuntimeError("LibreLinkUp login succeeded without authTicket/user.id.")
+
+    return {
+        "base_url": base,
+        "token": token,
+        "expires_at": int(ticket.get("expires") or (time.time() + 86400)),
+        "account_id_sha256": hashlib.sha256(str(user_id).encode("utf-8")).hexdigest(),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+async def _llu_sync_latest(force_login: bool = False) -> dict[str, Any]:
+    """Sync latest Libre 3+ CGM readings from LibreLinkUp into Firestore daily buckets."""
+    email = os.environ.get("LLU_EMAIL", "").strip()
+    password = os.environ.get("LLU_PASSWORD", "").strip()
+    if not email or not password:
+        return {"ok": False, "status": "not_configured"}
+
+    db = _get_firestore_client()
+    sess_ref = db.collection(PROFILE_COLLECTION).document("llu_session")
+    session: dict[str, Any] = {}
+    if not force_login:
+        snap = await sess_ref.get()
+        if snap.exists:
+            session = snap.to_dict() or {}
+
+    now_ts = time.time()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        if not session.get("token") or int(session.get("expires_at") or 0) < (now_ts + 86400):
+            session = await _llu_login(client, email, password)
+            await sess_ref.set(session, merge=True)
+
+        auth_headers = {
+            "Authorization": f"Bearer {session['token']}",
+            "Account-Id": session["account_id_sha256"],
+            "product": "llu.android",
+            "version": LLU_VERSION,
+            "Accept": "application/json",
+        }
+        base = str(session["base_url"])
+
+        conn_resp = await client.get(f"{base}/llu/connections", headers=auth_headers)
+        if conn_resp.status_code == 401 and not force_login:
+            return await _llu_sync_latest(force_login=True)
+        conn_resp.raise_for_status()
+        conns = (conn_resp.json().get("data") or [])
+        if not conns:
+            return {
+                "ok": True,
+                "status": "awaiting_connection_acceptance",
+                "message": "LibreLinkUp account authenticated, but 0 patient connections exist yet. Accept the invite in the LibreLinkUp app.",
+            }
+
+        c0 = conns[0]
+        patient_id = str(c0.get("patientId") or "")
+        if not patient_id:
+            return {"ok": False, "status": "missing_patient_id"}
+
+        graph_resp = await client.get(
+            f"{base}/llu/connections/{patient_id}/graph", headers=auth_headers
+        )
+        graph_resp.raise_for_status()
+        gdata = graph_resp.json().get("data") or {}
+        conn_obj = gdata.get("connection") or c0
+        sensor = conn_obj.get("sensor") or {}
+        sensor_start_epoch = sensor.get("a")
+        sensor_expires_at: str | None = None
+        if sensor_start_epoch:
+            try:
+                # Libre 3 Plus sensor duration is 15 days
+                exp_dt = datetime.fromtimestamp(int(sensor_start_epoch), tz=timezone.utc) + timedelta(days=15)
+                sensor_expires_at = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                pass
+
+        raw_points: list[dict[str, Any]] = list(gdata.get("graphData") or [])
+        latest_gm = conn_obj.get("glucoseMeasurement")
+        if isinstance(latest_gm, dict) and latest_gm.get("ValueInMgPerDl") is not None:
+            raw_points.append(latest_gm)
+
+        by_day: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        for pt in raw_points:
+            mg = pt.get("ValueInMgPerDl")
+            if mg is None:
+                continue
+            dt_utc = _parse_llu_timestamp(pt.get("FactoryTimestamp") or pt.get("Timestamp"))
+            if not dt_utc:
+                continue
+            ts_key = dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            local_day = dt_utc.astimezone(USER_TZ).date().isoformat()
+            trend = pt.get("TrendArrow")
+            by_day[local_day][ts_key] = {
+                "mg_dl": round(float(mg), 1),
+                "mmol_l": _mg_to_mmol(float(mg)),
+                **({"trend": int(trend)} if trend is not None else {}),
+            }
+
+        synced_days = 0
+        total_points = 0
+        for local_day, new_pts in by_day.items():
+            doc_ref = db.collection(GLUCOSE_COLLECTION).document(local_day)
+            existing_snap = await doc_ref.get()
+            existing_pts = (existing_snap.to_dict() or {}).get("points") or {} if existing_snap.exists else {}
+            merged_pts = {**existing_pts, **new_pts}
+            stats = _compute_glucose_day_stats(merged_pts)
+            doc_payload = {
+                "date": local_day,
+                "source": "librelinkup",
+                "points": merged_pts,
+                **stats,
+                "sensor_serial": sensor.get("sn"),
+                "sensor_expires_at": sensor_expires_at,
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            await doc_ref.set(doc_payload, merge=True)
+            synced_days += 1
+            total_points += len(new_pts)
+
+        return {
+            "ok": True,
+            "status": "synced",
+            "days_updated": synced_days,
+            "points_ingested": total_points,
+            "sensor_expires_at": sensor_expires_at,
+        }
+
+
+@mcp.custom_route("/cron/sync-glucose", methods=["POST", "GET"])
+async def cron_sync_glucose(request: Request) -> JSONResponse:
+    expected = os.environ.get("CRON_SECRET", "").strip()
+    if not expected:
+        return JSONResponse({"ok": False, "error": "CRON_SECRET not configured"}, status_code=503)
+    provided = request.headers.get("x-cron-secret", "").strip()
+    if not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    try:
+        result = await _llu_sync_latest()
+        return JSONResponse(result, status_code=200)
+    except Exception as exc:
+        logger.exception("Cron glucose sync failed")
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_glucose(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    include_meal_spikes: bool = True,
+) -> dict[str, Any]:
+    """
+    Get FreeStyle Libre 3+ CGM glucose analytics (latest reading + trend arrow,
+    Time-in-Range 70-140 mg/dL Metabolic Optimal & 70-180 clinical, Mean, %CV, GMI,
+    fasting glucose, and optional 2-hour post-meal glucose spike correlation).
+    Defaults to the last 7 days (max 30).
+    """
+    _get_verified_token()
+    start, end = _default_date_range(start_date, end_date, default_days=7)
+
+    # Best-effort live freshness sync if configured
+    sync_status: str | None = None
+    try:
+        if os.environ.get("LLU_EMAIL") and os.environ.get("LLU_PASSWORD"):
+            sync_res = await _llu_sync_latest()
+            sync_status = str(sync_res.get("status") or "")
+    except Exception as exc:
+        sync_status = f"sync_error: {exc}"
+
+    db = _get_firestore_client()
+    query = (
+        db.collection(GLUCOSE_COLLECTION)
+        .where("date", ">=", start)
+        .where("date", "<=", end)
+    )
+    day_docs: list[dict[str, Any]] = []
+    async for snap in query.stream():
+        d = snap.to_dict() or {}
+        if "date" not in d:
+            d["date"] = snap.id
+        day_docs.append(d)
+    day_docs.sort(key=lambda x: str(x.get("date", "")))
+
+    all_points: list[tuple[datetime, float, int | None]] = []
+    daily_stats: list[dict[str, Any]] = []
+    sensor_expires_at: str | None = None
+    for d in day_docs:
+        if d.get("sensor_expires_at"):
+            sensor_expires_at = str(d["sensor_expires_at"])
+        daily_stats.append(
+            {
+                k: d.get(k)
+                for k in (
+                    "date",
+                    "sample_count",
+                    "mean_mg_dl",
+                    "mean_mmol_l",
+                    "min_mg_dl",
+                    "max_mg_dl",
+                    "cv_pct",
+                    "tir_70_140_pct",
+                    "tir_70_180_pct",
+                    "fasting_mg_dl",
+                    "fasting_mmol_l",
+                )
+            }
+        )
+        for ts_str, pt in (d.get("points") or {}).items():
+            mg = pt.get("mg_dl")
+            if mg is None:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                all_points.append((dt, float(mg), pt.get("trend")))
+            except Exception:
+                continue
+
+    all_points.sort(key=lambda x: x[0])
+
+    if not all_points:
+        return {
+            "timezone": USER_TIMEZONE_NAME,
+            "start_date": start,
+            "end_date": end,
+            "sync_status": sync_status,
+            "sample_count": 0,
+            "latest": None,
+            "summary": None,
+            "daily_stats": [],
+            "meal_spikes": [],
+        }
+
+    vals = [p[1] for p in all_points]
+    n = len(vals)
+    mean_mg = sum(vals) / n
+    sd_mg = math.sqrt(sum((v - mean_mg) ** 2 for v in vals) / n)
+    cv_pct = round((sd_mg / mean_mg) * 100.0, 1) if mean_mg > 0 else 0.0
+    gmi_pct = round(3.31 + 0.02392 * mean_mg, 2)
+    tir_opt = round(sum(1 for v in vals if 70.0 <= v <= 140.0) / n * 100.0, 1)
+    tir_clin = round(sum(1 for v in vals if 70.0 <= v <= 180.0) / n * 100.0, 1)
+    fasting_days = [float(d["fasting_mg_dl"]) for d in daily_stats if d.get("fasting_mg_dl") is not None]
+    fasting_avg = round(sum(fasting_days) / len(fasting_days), 1) if fasting_days else None
+
+    last_dt, last_mg, last_trend = all_points[-1]
+    arrow, trend_label = LLU_TREND_MAP.get(int(last_trend or 3), ("→", "stable"))
+    age_min = max(0, round((datetime.now(timezone.utc) - last_dt).total_seconds() / 60.0))
+    sensor_days_left: float | None = None
+    if sensor_expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(sensor_expires_at.replace("Z", "+00:00"))
+            sensor_days_left = round(max(0.0, (exp_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0), 1)
+        except Exception:
+            pass
+
+    # 2-hour post-meal glucose spike correlation
+    meal_spikes: list[dict[str, Any]] = []
+    if include_meal_spikes:
+        try:
+            meals_fn = getattr(get_meals, "fn", get_meals)
+            meals_res = await meals_fn(start_date=start, end_date=end)
+            for mp in meals_res.get("meals", []):
+                nl = mp.get("nutritionLog", {})
+                start_ts = nl.get("interval", {}).get("startTime")
+                if not start_ts:
+                    continue
+                m_dt = datetime.fromisoformat(str(start_ts).replace("Z", "+00:00"))
+                pre_pts = [v for dt, v, _ in all_points if -20 * 60 <= (dt - m_dt).total_seconds() <= 10 * 60]
+                post_pts = [(dt, v) for dt, v, _ in all_points if 10 * 60 < (dt - m_dt).total_seconds() <= 120 * 60]
+                if not pre_pts or not post_pts:
+                    continue
+                pre_mg = sum(pre_pts) / len(pre_pts)
+                peak_dt, peak_mg = max(post_pts, key=lambda x: x[1])
+                delta_mg = round(peak_mg - pre_mg, 1)
+                meal_spikes.append(
+                    {
+                        "meal_time": m_dt.astimezone(USER_TZ).strftime("%Y-%m-%d %H:%M"),
+                        "food": nl.get("foodDisplayName") or nl.get("food") or "Meal",
+                        "kcal": round(float(nl.get("energy", {}).get("kcal") or 0), 1),
+                        "carbs_g": round(float(nl.get("totalCarbohydrate", {}).get("grams") or 0), 1),
+                        "pre_meal_mmol_l": _mg_to_mmol(pre_mg),
+                        "peak_mmol_l": _mg_to_mmol(peak_mg),
+                        "delta_mmol_l": round(_mg_to_mmol(peak_mg) - _mg_to_mmol(pre_mg), 2),
+                        "pre_meal_mg_dl": round(pre_mg, 1),
+                        "peak_mg_dl": round(peak_mg, 1),
+                        "delta_mg_dl": delta_mg,
+                        "time_to_peak_min": round((peak_dt - m_dt).total_seconds() / 60.0),
+                    }
+                )
+        except Exception:
+            pass
+
+    return {
+        "timezone": USER_TIMEZONE_NAME,
+        "start_date": start,
+        "end_date": end,
+        "sync_status": sync_status,
+        "sample_count": n,
+        "latest": {
+            "mg_dl": round(last_mg, 1),
+            "mmol_l": _mg_to_mmol(last_mg),
+            "trend_arrow": arrow,
+            "trend_label": trend_label,
+            "timestamp": last_dt.astimezone(USER_TZ).strftime("%Y-%m-%d %H:%M"),
+            "age_minutes": age_min,
+            "sensor_days_left": sensor_days_left,
+        },
+        "summary": {
+            "mean_mg_dl": round(mean_mg, 1),
+            "mean_mmol_l": _mg_to_mmol(mean_mg),
+            "gmi_pct": gmi_pct,
+            "cv_pct": cv_pct,
+            "tir_70_140_pct": tir_opt,
+            "tir_70_180_pct": tir_clin,
+            "fasting_avg_mg_dl": fasting_avg,
+            "fasting_avg_mmol_l": _mg_to_mmol(fasting_avg) if fasting_avg is not None else None,
+        },
+        "daily_stats": daily_stats,
+        "meal_spikes": meal_spikes[-15:],
+    }
+
+
+# ============================================================================
+# VITAMINS, SUPPLEMENTS & MEDICATIONS (FIRESTORE: supplement_med_logs)
+# ============================================================================
+
+
+@mcp.tool(annotations=WRITE_ANNOTATIONS)
+async def log_supplement_or_med(
+    items: list[dict[str, Any]],
+    date: str | None = None,
+    taken_at: str | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """
+    Log one or more vitamins, supplements, or medications to Firestore (`supplement_med_logs`).
+
+    Each item dict accepts:
+      - name (required str, e.g. "Creatine Monohydrate", "Magnesium Glycinate", "Vitamin D3")
+      - category (optional: "vitamin" | "supplement" | "medication", defaults to "supplement")
+      - dose (optional float/int, e.g. 5, 400, 2000)
+      - unit (optional str, e.g. "g", "mg", "IU", "mcg", "capsule")
+      - timing (optional: "morning" | "pre_workout" | "with_meal" | "evening" | "as_needed")
+    """
+    _get_verified_token()
+    if not items or not isinstance(items, list):
+        raise ValueError("items must be a non-empty list of supplement/medication objects.")
+
+    if taken_at:
+        dt = datetime.fromisoformat(taken_at.replace("Z", "+00:00"))
+        dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+
+    day = _parse_date(date).date().isoformat() if date else dt.astimezone(USER_TZ).date().isoformat()
+    taken_iso = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    db = _get_firestore_client()
+    logged: list[dict[str, Any]] = []
+    for raw in items[:20]:
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        cat = str(raw.get("category") or "supplement").strip().lower()
+        if cat not in VALID_SUPP_CATEGORIES:
+            cat = "supplement"
+        timing = str(raw.get("timing") or "morning").strip().lower()
+        if timing not in VALID_SUPP_TIMINGS:
+            timing = "as_needed"
+        dose_val = raw.get("dose")
+        dose = round(float(dose_val), 2) if dose_val is not None and str(dose_val).strip() != "" else None
+        unit = str(raw.get("unit") or "").strip()
+        item_notes = str(raw.get("notes") or notes or "").strip()
+
+        doc: dict[str, Any] = {
+            "date": day,
+            "taken_at": taken_iso,
+            "name": name,
+            "name_key": name.lower(),
+            "category": cat,
+            "timing": timing,
+        }
+        if dose is not None:
+            doc["dose"] = dose
+        if unit:
+            doc["unit"] = unit
+        if item_notes:
+            doc["notes"] = item_notes[:300]
+
+        _, doc_ref = await db.collection(SUPPLEMENTS_COLLECTION).add(doc)
+        logged.append({"log_id": doc_ref.id, **doc})
+
+    if not logged:
+        raise ValueError("No valid items with a non-empty 'name' were provided.")
+
+    return {"status": "logged", "date": day, "count": len(logged), "entries": logged}
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def get_supplement_med_logs(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    category: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """
+    Read logged vitamins, supplements, and medications from Firestore (`supplement_med_logs`).
+    Defaults to the last 14 days.
+    """
+    _get_verified_token()
+    start, end = _default_date_range(start_date, end_date, default_days=14)
+    clamped_limit = max(1, min(int(limit), 200))
+    cat_filter = category.strip().lower() if category else None
+
+    db = _get_firestore_client()
+    query = (
+        db.collection(SUPPLEMENTS_COLLECTION)
+        .where("date", ">=", start)
+        .where("date", "<=", end)
+    )
+    entries: list[dict[str, Any]] = []
+    async for snap in query.stream():
+        d = snap.to_dict() or {}
+        if cat_filter and str(d.get("category", "")).lower() != cat_filter:
+            continue
+        entries.append({"log_id": snap.id, **d})
+
+    entries.sort(key=lambda x: str(x.get("taken_at") or x.get("date") or ""), reverse=True)
+    entries = entries[:clamped_limit]
+
+    adherence: dict[str, int] = defaultdict(int)
+    for e in entries:
+        adherence[str(e.get("name", "Unknown"))] += 1
+
+    return {
+        "timezone": USER_TIMEZONE_NAME,
+        "start_date": start,
+        "end_date": end,
+        "log_count": len(entries),
+        "adherence_counts": dict(sorted(adherence.items(), key=lambda kv: -kv[1])),
+        "logs": entries,
+    }
+
+
+@mcp.tool(annotations=DELETE_ANNOTATIONS)
+async def delete_supplement_med_log(log_id: str) -> dict[str, Any]:
+    """Delete a supplement/vitamin/medication log entry from Firestore by `log_id`."""
+    _get_verified_token()
+    cleaned = log_id.strip()
+    if not cleaned:
+        raise ValueError("log_id is required.")
+    db = _get_firestore_client()
+    doc_ref = db.collection(SUPPLEMENTS_COLLECTION).document(cleaned)
+    snap = await doc_ref.get()
+    if not snap.exists:
+        return {"status": "not_found", "log_id": cleaned}
+    await doc_ref.delete()
+    return {"status": "deleted", "log_id": cleaned}
 
 
 class FilterOAuthScopesMiddleware:
